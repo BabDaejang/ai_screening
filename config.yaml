@@ -1,0 +1,118 @@
+# ============================================================
+# AI 사용 의심 선별 도구 — 설정 파일
+# 교사가 필요에 따라 편집 가능합니다.
+# ============================================================
+
+# 1단계 규칙 검사 가중치 (합계 100 권장)
+weights:
+  special_chars: 15        # 특수문자 밀도
+  markdown_remnants: 20    # 마크다운 잔재
+  chatbot_phrases: 20      # 챗봇 상투구
+  paste_artifacts: 15      # 복붙 절단 흔적
+  structural_homogeneity: 15  # 구조 균질성
+  metadata_anomaly: 15     # 메타데이터 이상 (docx만)
+
+# 각 항목별 세부 설정
+rules:
+  special_chars:
+    # 검사 대상 특수문자
+    targets: "「」『』《》〈〉·—…※"
+    # 밀도 임계값 (이 이상이면 100점)
+    max_density: 0.03
+
+  markdown_remnants:
+    # 검출 패턴 (정규식)
+    patterns:
+      - name: "bold_markers"
+        regex: "\\*\\*[^*]+\\*\\*"
+        description: "볼드 마커 (**text**)"
+      - name: "heading_markers"
+        regex: "^#{1,6}\\s"
+        description: "헤딩 마커 (## )"
+      - name: "horizontal_rules"
+        regex: "^-{3,}$"
+        description: "수평선 (---)"
+      - name: "unordered_list"
+        regex: "^[\\-•]\\s"
+        description: "비순서 목록 (- , • )"
+      - name: "ordered_list"
+        regex: "^\\d+\\.\\s"
+        description: "순서 목록 (1. 2. 3.)"
+      - name: "backticks"
+        regex: "`[^`]+`"
+        description: "백틱 인라인 코드"
+
+  structural_homogeneity:
+    # 변동계수 임계값 (이 미만이면 균질성 의심)
+    cv_threshold: 0.25
+    # 최소 문단 수 (이 미만이면 검사 건너뜀)
+    min_paragraphs: 4
+
+  metadata:
+    # 1,000자당 최소 편집 시간 (분)
+    min_edit_time_per_1000_chars: 5
+
+# 챗봇 상투구 목록
+cliche_phrases:
+  - "물론입니다"
+  - "도움이 되었기를"
+  - "궁금한 점이 있으시면"
+  - "요약하자면"
+  - "결론적으로 말하자면"
+  - "~에 대해 알아보겠습니다"
+  - "에 대해 알아보겠습니다"
+  - "다양한 측면에서"
+  - "살펴보겠습니다"
+  - "종합적으로 볼 때"
+  - "이러한 관점에서"
+  - "시사하는 바가 크다"
+  - "단순한"
+  - "을 넘어"
+
+# 등급 산정
+tier:
+  # 상위 N% 이내면 "상" (rule_score와 ai_score 모두)
+  threshold_percentile: 30
+
+# API 단가 (USD per 1M tokens)
+pricing:
+  anthropic:
+    claude-haiku-4-5:
+      input: 1.0
+      output: 5.0
+      cache_read_ratio: 0.1   # cache_read 비용 = input × ratio
+      cache_write_ratio: 1.25 # cache_write 비용 = input × ratio
+    claude-sonnet-4-6:
+      input: 3.0
+      output: 15.0
+      cache_read_ratio: 0.1
+      cache_write_ratio: 1.25
+  gemini:
+    gemini-2.0-flash:
+      input: 0.075
+      output: 0.30
+    gemini-2.5-pro:
+      input: 1.25
+      output: 10.0
+  openai:
+    gpt-4o-mini:
+      input: 0.15
+      output: 0.60
+    gpt-4o:
+      input: 2.50
+      output: 10.0
+  web_search:
+    per_1000_calls: 10.0
+
+# 프로바이더별 예외용 Fallback 모델 안전망 목록 (API 호출 실패 시 최종 대체재)
+fallback_models:
+  anthropic:
+    - claude-haiku-4-5
+    - claude-sonnet-4-6
+  gemini:
+    - gemini-2.0-flash
+    - gemini-2.5-flash
+    - gemini-2.5-pro
+  openai:
+    - gpt-4o-mini
+    - gpt-4o

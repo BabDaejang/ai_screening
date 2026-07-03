@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 독서 수행평가 선별 대시보드</title>
+    <!-- Modern Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="glass-bg"></div>
+
+    <header class="app-header">
+        <div class="header-logo">
+            <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+            </svg>
+            <h1>AI 의심 선별 및 사실 검증 시스템</h1>
+        </div>
+        <div class="user-profile-status" id="profileStatus">
+            <span class="status-indicator offline"></span>
+            <span class="status-text">로딩 중...</span>
+            <button class="btn btn-sm btn-outline" id="btnAuthAction">로그인</button>
+        </div>
+    </header>
+
+    <main class="app-container">
+        <!-- 보안 로그인 안내 (미로그인시 표시) -->
+        <section class="auth-required-panel card" id="authRequiredPanel">
+            <div class="panel-content">
+                <svg class="lock-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                </svg>
+                <h2>보안 로그인이 필요합니다</h2>
+                <p>로컬 프로필을 활성화하기 위해 로그인해주세요.</p>
+                <button class="btn btn-primary" id="btnTriggerLogin">프로필 로그인</button>
+            </div>
+        </section>
+
+        <!-- 메인 제어 및 대시보드 (로그인 완료시 표시) -->
+        <div class="dashboard-grid" id="mainDashboard" style="display: none;">
+            
+            <!-- 왼쪽: 제어 패널, API 키 관리 및 로그 -->
+            <div class="column-left">
+                <!-- 1. 분석 실행 카드 -->
+                <section class="control-panel card">
+                    <h3>🔍 분석 실행</h3>
+                    <div class="form-group">
+                        <label for="submissionsDir">제출물 경로 (폴더 또는 단일 파일: Excel, CSV, PDF, TXT, DOCX)</label>
+                        <div class="path-input-row">
+                            <input type="text" id="submissionsDir" placeholder="예: C:\documents\submissions" value="tests/samples/submissions">
+                            <button class="btn btn-folder-browse" id="btnBrowseFolder" title="폴더 선택">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                                </svg>
+                                폴더 선택
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- 모델 선택 드롭다운 (실시간 조합형) -->
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label for="selectScreeningProvider">2단계 스크리닝 API</label>
+                            <select id="selectScreeningProvider">
+                                <option value="gemini">Google Gemini</option>
+                                <option value="anthropic">Anthropic Claude</option>
+                                <option value="openai">OpenAI GPT</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="selectScreeningModel">스크리닝 모델</label>
+                            <select id="selectScreeningModel">
+                                <!-- JS 동적 주입 -->
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label for="selectVerifyProvider">3단계 검증 API</label>
+                            <select id="selectVerifyProvider">
+                                <option value="anthropic">Anthropic Claude</option>
+                                <option value="gemini">Google Gemini</option>
+                                <option value="openai">OpenAI GPT</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="selectVerifyModel">검증 모델</label>
+                            <select id="selectVerifyModel">
+                                <!-- JS 동적 주입 -->
+                            </select>
+                        </div>
+                    </div>
+
+                    <p class="model-helper-text">
+                        💡 **다중 모델 결합 기능 지원**: 스크리닝과 검증 단계의 API를 다르게 설정하여 실행할 수 있습니다. (예: 2단계 Gemini + 3단계 Claude 조합)
+                    </p>
+
+                    <div class="options-group" style="margin-top: 15px;">
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="verifyAll">
+                            <span class="checkmark"></span>
+                            전체 3단계 검증 수행 (주의자 외 학생도 검증)
+                        </label>
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="noVerify">
+                            <span class="checkmark"></span>
+                            3단계 사실 검증 생략
+                        </label>
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="noWeb">
+                            <span class="checkmark"></span>
+                            팩트시트 생성 시 웹 검색 비활성화
+                        </label>
+                    </div>
+                    <button class="btn btn-primary btn-block" id="btnStartAnalyze">
+                        <svg class="play-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polygon points="5 3 19 12 5 21 5 3"/>
+                        </svg>
+                        선별 검사 시작
+                    </button>
+                </section>
+
+                <!-- 2. API 키 관리 카드 -->
+                <section class="api-keys-panel card">
+                    <div class="panel-header-row">
+                        <h3>🔑 API 키 관리</h3>
+                        <div style="display: flex; gap: 8px;">
+                            <button class="btn btn-sm btn-outline" id="btnRefreshModelList" title="AI 모델 목록 동적 갱신">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="12" height="12" style="margin-right: 4px;">
+                                    <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                                </svg>
+                                모델 갱신
+                            </button>
+                            <button class="btn btn-sm btn-primary" id="btnOpenBatchKeyModal">일괄 등록/수정</button>
+                        </div>
+                    </div>
+                    <p class="section-desc">현재 로그인 계정에 여러 AI API 키를 안전하게 통합 등록해 둡니다.</p>
+                    <div class="api-keys-list" id="apiKeysList">
+                        <!-- API 등록 상태 행들 -->
+                    </div>
+                </section>
+
+                <!-- 3. 실시간 로딩바 및 콘솔 -->
+                <section class="progress-panel card" id="progressPanel" style="display: none;">
+                    <div class="progress-header">
+                        <span class="step-title" id="progressStep">분석 대기 중</span>
+                        <span class="step-percent" id="progressPercent">0%</span>
+                    </div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar-fill" id="progressBarFill" style="width: 0%;"></div>
+                    </div>
+                    <div class="console-log-box" id="consoleLogs">
+                        <div class="log-line system-line">> 시스템이 대기 중입니다.</div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- 오른쪽: 분석 통계 및 결과 목록 -->
+            <div class="column-right">
+                <!-- 통계 카드 요약 -->
+                <section class="summary-widgets">
+                    <div class="widget card">
+                        <div class="widget-icon bg-blue">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                        </div>
+                        <div class="widget-data">
+                            <span class="widget-val" id="statTotalStudents">0명</span>
+                            <span class="widget-lbl">전체 제출물</span>
+                        </div>
+                    </div>
+                    <div class="widget card">
+                        <div class="widget-icon bg-red">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                        </div>
+                        <div class="widget-data">
+                            <span class="widget-val" id="statPriorityStudents">0명</span>
+                            <span class="widget-lbl">주의 대상 (최우선/상)</span>
+                        </div>
+                    </div>
+                    <div class="widget card">
+                        <div class="widget-icon bg-green">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+                        </div>
+                        <div class="widget-data">
+                            <span class="widget-val" id="statEstimatedCost">$0.0000</span>
+                            <span class="widget-lbl">API 예상 비용</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 분석 결과 리스트 -->
+                <section class="results-panel card">
+                    <div class="results-header">
+                        <h3>📋 선별 결과 목록</h3>
+                        <div class="results-actions">
+                            <select id="filterTier" class="form-select select-sm">
+                                <option value="all">모든 등급</option>
+                                <option value="최우선">🚨 최우선 (모순 검출)</option>
+                                <option value="상">🔴 상 (강한 의심)</option>
+                                <option value="중">🟡 중 (의심 신호 존재)</option>
+                                <option value="하">🟢 하 (안전)</option>
+                            </select>
+                            <button class="btn btn-sm btn-success" id="btnExportCSV" disabled>
+                                <svg class="download-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+                                </svg>
+                                CSV 다운로드
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="table-container">
+                        <table class="data-table" id="resultsTable">
+                            <thead>
+                                <tr>
+                                    <th>학생</th>
+                                    <th>도서명</th>
+                                    <th>규칙 점수</th>
+                                    <th>AI 점수</th>
+                                    <th>할루 점수</th>
+                                    <th>판정 등급</th>
+                                    <th>조회</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr class="empty-row">
+                                    <td colspan="7">제출물 분석을 수행하면 결과 리스트가 여기에 나타납니다.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+        </div>
+    </main>
+
+    <!-- ------------------------------------------------------------- -->
+    <!-- 모달 창 정의 -->
+    <!-- ------------------------------------------------------------- -->
+    
+    <!-- 1. 로그인/프로필 관리 모달 -->
+    <div class="modal-backdrop" id="modalAuth" style="display: none;">
+        <div class="modal card">
+            <div class="modal-header">
+                <h2>🔑 프로필 로그인 / 관리</h2>
+                <button class="btn-close" id="btnCloseAuthModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="profile-select-view" id="profileSelectView">
+                    <p class="modal-desc">로그인할 계정을 선택해 주세요.</p>
+                    <div class="profile-cards-list" id="profileCardsList">
+                        <!-- 프로필 카드가 동적으로 주입됨 -->
+                    </div>
+                    <hr class="modal-hr">
+                    <div class="modal-footer-actions">
+                        <button class="btn btn-outline" id="btnGoToCreateProfile">새 계정 생성</button>
+                    </div>
+                </div>
+
+                <div class="profile-create-view" id="profileCreateView" style="display: none;">
+                    <p class="modal-desc">새 사용자 계정(프로필)을 생성합니다. API Key는 로그인 후 대시보드에서 일괄 등록합니다.</p>
+                    <div class="form-group">
+                        <label for="newProfileName">사용자 ID (프로필명)</label>
+                        <input type="text" id="newProfileName" placeholder="예: 국어교사_김철수">
+                    </div>
+                    <div class="modal-footer-actions" style="margin-top: 25px;">
+                        <button class="btn btn-outline" id="btnCancelCreateProfile">취소</button>
+                        <button class="btn btn-primary" id="btnCreateProfileSubmit">계정 생성</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 2. API Key 일괄 등록/수정 모달 -->
+    <div class="modal-backdrop" id="modalRegisterKey" style="display: none;">
+        <div class="modal card">
+            <div class="modal-header">
+                <h2>🔑 API Key 일괄 등록 / 변경</h2>
+                <button class="btn-close" id="btnCloseRegisterKeyModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="modal-desc">원하는 인공지능 API 키를 입력한 뒤 저장해 주세요. 여러 개를 한 번에 등록할 수 있습니다.</p>
+                
+                <div class="form-group">
+                    <label for="regGeminiKey">Google Gemini API Key</label>
+                    <input type="password" id="regGeminiKey" placeholder="Gemini Key 입력 (미입력 시 변경 안 함)">
+                </div>
+
+                <div class="form-group">
+                    <label for="regAnthropicKey">Anthropic Claude API Key</label>
+                    <input type="password" id="regAnthropicKey" placeholder="Claude Key 입력 (미입력 시 변경 안 함)">
+                </div>
+
+                <div class="form-group">
+                    <label for="regOpenaiKey">OpenAI GPT API Key</label>
+                    <input type="password" id="regOpenaiKey" placeholder="GPT Key 입력 (미입력 시 변경 안 함)">
+                </div>
+
+                <div class="modal-footer-actions" style="margin-top: 20px;">
+                    <button class="btn btn-outline" id="btnCancelRegisterKey">취소</button>
+                    <button class="btn btn-primary" id="btnRegisterKeySubmit">저장</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 3. 학생 상세 리포트 모달 -->
+    <div class="modal-backdrop" id="modalStudentDetail" style="display: none;">
+        <div class="modal modal-lg card">
+            <div class="modal-header">
+                <h2>📄 상세 선별 리포트: <span id="detailStudentName">홍길동</span></h2>
+                <button class="btn-close" id="btnCloseDetailModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="report-tabs">
+                    <button class="tab-btn active" data-target="tabSummary">선별 분석 요약</button>
+                    <button class="tab-btn" data-target="tabFullReport">마크다운 리포트 전문</button>
+                    <button class="tab-btn" data-target="tabOriginalText">학생 제출본 전문</button>
+                </div>
+
+                <div class="tab-content-container">
+                    <!-- 요약 탭 -->
+                    <div class="tab-content active" id="tabSummary">
+                        <div class="detail-grid">
+                            <div class="detail-scores card">
+                                <h4>📊 통합 평점 지표</h4>
+                                <div class="score-grid">
+                                    <div class="score-card">
+                                        <span class="score-title">규칙 점수</span>
+                                        <span class="score-val" id="detailRuleScore">0</span>
+                                    </div>
+                                    <div class="score-card">
+                                        <span class="score-title">AI 심사 점수</span>
+                                        <span class="score-val" id="detailAIScore">0</span>
+                                    </div>
+                                    <div class="score-card">
+                                        <span class="score-title">사실 모순율</span>
+                                        <span class="score-val" id="detailHallScore">0</span>
+                                    </div>
+                                </div>
+                                <div class="tier-banner" id="detailTierBanner">등급: 하</div>
+                            </div>
+                            <div class="detail-evidence card">
+                                <h4>📋 1단계 규칙 매칭 증거</h4>
+                                <ul class="evidence-list" id="detailRuleEvidence">
+                                    <li>매칭된 규칙이 없습니다.</li>
+                                </ul>
+                            </div>
+                        </div>
+
+                        <div class="detail-row card" style="margin-top: 20px;">
+                            <h4>🤖 2단계 AI 스크리닝 요약</h4>
+                            <div class="signals-box">
+                                <span class="badge-label">AI 문체 감지 신호:</span>
+                                <div class="badges-wrap" id="detailAISignals">
+                                    <!-- 신호 배지들 -->
+                                </div>
+                            </div>
+                            <p class="rationale-text" id="detailAIRationale">로딩 중...</p>
+                        </div>
+
+                        <div class="detail-row card" style="margin-top: 20px;">
+                            <h4>📍 3단계 사실 주장 및 모순 검증 결과</h4>
+                            <div class="table-container" style="margin-top: 10px;">
+                                <table class="data-table fact-table" id="detailFactClaimsTable">
+                                    <thead>
+                                        <tr>
+                                            <th>원문 주장</th>
+                                            <th>판정</th>
+                                            <th>판단 근거 설명</th>
+                                            <th>팩트시트 근거</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <tr>
+                                            <td colspan="4" class="text-center">데이터가 없습니다.</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        <div class="detail-row card questions-card" style="margin-top: 20px;">
+                            <h4>📌 추천 구술 면담 질문 (AI 모순 대조용)</h4>
+                            <ol class="questions-list" id="detailQuestions">
+                                <li>추천 질문이 없습니다.</li>
+                            </ol>
+                        </div>
+                    </div>
+
+                    <!-- 마크다운 리포트 전문 탭 -->
+                    <div class="tab-content" id="tabFullReport">
+                        <div class="markdown-body" id="detailReportMarkdownHtml">
+                            <!-- HTML 변환된 마크다운 결과물 -->
+                        </div>
+                    </div>
+
+                    <!-- 원문 전문 탭 -->
+                    <div class="tab-content" id="tabOriginalText">
+                        <pre class="original-submission-text" id="detailOriginalText">제출본이 없습니다.</pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 스크립트 연결 -->
+    <script src="app.js"></script>
+</body>
+</html>

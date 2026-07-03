@@ -1,0 +1,25 @@
+# 환경 변수 및 키 파일 (보안 필독)
+.env
+
+# Python 컴파일 및 캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# 가상 환경 및 프로젝트 의존성 폴더
+venv/
+.venv/
+env/
+ENV/
+
+# 학생 감상문 분석 결과물 및 도서 팩트시트 (보안/개인정보)
+outputs/
+factsheets/
+
+# 분석 수행 시 적재되는 임시 모델 캐시 파일
+models_cache.json
+
+# 로그 파일
+*.log
