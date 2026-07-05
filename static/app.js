@@ -1052,6 +1052,51 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    // 메인 결과 테이블과 [로컬 도서 인벤토리] 패널이 공유하는 "팩트시트 보강" 트리거.
+    // 두 위치의 버튼 모두 동일한 /api/analyze/enrich-factsheet 엔드포인트를 호출한다.
+    async function triggerEnrichFactsheet(btn, bookTitle, author) {
+        if (!bookTitle) {
+            alert("도서 정보가 존재하지 않습니다.");
+            return;
+        }
+
+        try {
+            btn.disabled = true;
+            btn.textContent = "보강 중...";
+
+            const res = await fetch("/api/analyze/enrich-factsheet", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ book_title: bookTitle, author: author })
+            });
+
+            if (res.ok) {
+                const consoleLogs = document.getElementById("consoleLogs");
+                if (consoleLogs) {
+                    const timeStr = new Date().toLocaleTimeString();
+                    const logDiv = document.createElement("div");
+                    logDiv.className = "log-line info-line";
+                    logDiv.textContent = `> [${timeStr}] 팩트시트 보강 완료 (${bookTitle} - ${author || '저자 미상'})`;
+                    consoleLogs.appendChild(logDiv);
+                    consoleLogs.scrollTop = consoleLogs.scrollHeight;
+                }
+                btn.textContent = "보강 완료";
+                // 인벤토리 패널이 열려 있다면 갱신된 팩트시트 메타데이터를 즉시 반영
+                await fetchBookInventory();
+            } else {
+                const errData = await res.json();
+                alert(`보강 실패: ${errData.detail || '알 수 없는 오류'}`);
+                btn.disabled = false;
+                btn.textContent = "팩트시트 보강";
+            }
+        } catch (err) {
+            console.error("보강 API 통신 에러:", err);
+            alert("보강 중 통신 에러가 발생했습니다.");
+            btn.disabled = false;
+            btn.textContent = "팩트시트 보강";
+        }
+    }
+
     function renderBookInventory(books) {
         if (!bookInventoryTableBody) return;
 
@@ -1074,9 +1119,14 @@ document.addEventListener("DOMContentLoaded", () => {
                 <td>${escapeHtml(b.author || "-")}</td>
                 <td style="font-size: 11.5px; color: var(--text-muted);">${escapeHtml(b.updated_at || "-")}</td>
                 <td>
-                    <button class="btn btn-sm btn-outline btn-view-factsheet" data-cache-key="${escapeHtml(b.cache_key)}" data-title="${escapeHtml(b.book_title || "")}">
-                        팩트시트 확인
-                    </button>
+                    <div style="display: flex; gap: 6px;">
+                        <button class="btn btn-sm btn-outline btn-view-factsheet" data-cache-key="${escapeHtml(b.cache_key)}" data-title="${escapeHtml(b.book_title || "")}">
+                            팩트시트 확인
+                        </button>
+                        <button class="btn btn-sm btn-success btn-enrich-factsheet-inv" data-title="${escapeHtml(b.book_title || "")}" data-author="${escapeHtml(b.author || "")}">
+                            팩트시트 보강
+                        </button>
+                    </div>
                 </td>
             </tr>
         `).join("");
@@ -1084,6 +1134,13 @@ document.addEventListener("DOMContentLoaded", () => {
         document.querySelectorAll(".btn-view-factsheet").forEach(btn => {
             btn.addEventListener("click", () => {
                 openFactsheetView(btn.dataset.cacheKey, btn.dataset.title);
+            });
+        });
+
+        // Task(인벤토리): 메인 결과 테이블의 "팩트시트 보강"과 완전히 동일한 API를 호출한다.
+        document.querySelectorAll(".btn-enrich-factsheet-inv").forEach(btn => {
+            btn.addEventListener("click", () => {
+                triggerEnrichFactsheet(btn, btn.dataset.title, btn.dataset.author);
             });
         });
     }
@@ -1237,48 +1294,8 @@ document.addEventListener("DOMContentLoaded", () => {
         });
 
         document.querySelectorAll(".btn-enrich-factsheet").forEach(btn => {
-            btn.addEventListener("click", async () => {
-                const bookTitle = btn.dataset.title;
-                const author = btn.dataset.author;
-
-                if (!bookTitle) {
-                    alert("도서 정보가 존재하지 않습니다.");
-                    return;
-                }
-
-                try {
-                    btn.disabled = true;
-                    btn.textContent = "보강 중...";
-
-                    const res = await fetch("/api/analyze/enrich-factsheet", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ book_title: bookTitle, author: author })
-                    });
-
-                    if (res.ok) {
-                        const consoleLogs = document.getElementById("consoleLogs");
-                        if (consoleLogs) {
-                            const timeStr = new Date().toLocaleTimeString();
-                            const logDiv = document.createElement("div");
-                            logDiv.className = "log-line info-line";
-                            logDiv.textContent = `> [${timeStr}] 팩트시트 보강 완료 (${bookTitle} - ${author || '저자 미상'})`;
-                            consoleLogs.appendChild(logDiv);
-                            consoleLogs.scrollTop = consoleLogs.scrollHeight;
-                        }
-                        btn.textContent = "보강 완료";
-                    } else {
-                        const errData = await res.json();
-                        alert(`보강 실패: ${errData.detail || '알 수 없는 오류'}`);
-                        btn.disabled = false;
-                        btn.textContent = "팩트시트 보강";
-                    }
-                } catch (err) {
-                    console.error("보강 API 통신 에러:", err);
-                    alert("보강 중 통신 에러가 발생했습니다.");
-                    btn.disabled = false;
-                    btn.textContent = "팩트시트 보강";
-                }
+            btn.addEventListener("click", () => {
+                triggerEnrichFactsheet(btn, btn.dataset.title, btn.dataset.author);
             });
         });
     }

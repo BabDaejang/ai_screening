@@ -199,6 +199,32 @@ def normalize_cache_key(title: str, author: str) -> str:
     cleaned_author = re.sub(r'[\s\\/:*?"<>|]', '', author).strip()
     return f"{cleaned_title}_{cleaned_author}"
 
+# '도서명(저자명)' 또는 '도서명[저자명]' 복합 텍스트에서 후미 괄호를 캡처한다.
+_TITLE_AUTHOR_PATTERN = re.compile(r'^(.+?)\s*[\(\[](.+?)[\)\]]$')
+
+def parse_book_title_author(raw_title: Optional[str]) -> tuple[str, Optional[str]]:
+    """'도서명(저자명)' 형태의 복합 텍스트를 도서명/저자명으로 분리한다.
+
+    괄호/대괄호가 없거나 정규식 매칭에 실패하면 원본 문자열을 그대로 도서명으로
+    반환하고 저자는 None으로 반환한다 (예외 발생 없이 항상 안전하게 폴백).
+    """
+    if not raw_title:
+        return "", None
+    try:
+        cleaned = raw_title.strip()
+        if not cleaned:
+            return "", None
+        match = _TITLE_AUTHOR_PATTERN.match(cleaned)
+        if match:
+            title_part = match.group(1).strip()
+            author_part = match.group(2).strip()
+            if title_part and author_part:
+                return title_part, author_part
+        return cleaned, None
+    except Exception as e:
+        logger.warning(f"도서명/저자 분리 정규식 처리 실패 (원본 유지): {e}")
+        return (raw_title or "").strip(), None
+
 # -------------------------------------------------------------
 # 2단계 스크리닝 결과 Append-Only 영속화 & 체크포인트-재개(Resume) 엔진
 # (screening_results.jsonl)
@@ -832,11 +858,15 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                 check_control_state("1단계", i, len(submissions_to_process), sub["student"])
                 add_log(f"[1단계] ({i}/{len(submissions_to_process)}) {sub['student']} 검사 중...")
                 stage1_res = run_stage1(sub["text"], sub["metadata"], sub["filename"], config)
+                # '도서명(저자명)' 복합 텍스트 파싱: 도서명 필드에 후미 괄호로 저자명이
+                # 붙어 들어온 경우, 여기서 즉시 분리하여 저자 정보 유실을 방지한다.
+                parsed_book_title, parsed_author = parse_book_title_author(sub.get("book_title"))
                 res_item = {
                     "student": sub["student"],
                     "student_id": sub.get("student_id", ""),
                     "student_name": sub.get("student_name") or sub["student"],
-                    "book_title": sub.get("book_title") or "",
+                    "book_title": parsed_book_title,
+                    "author": parsed_author or "",
                     "text": sub["text"],
                     "file_type": sub["file_type"],
                     "file_path": sub["file_path"],
@@ -879,7 +909,14 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                     )
                     for book_title in unique_titles:
                         try:
-                            author = lookup_author(book_title, provider_verify_prefetch)
+                            # '도서명(저자명)' 파싱으로 이미 저자가 확보된 경우 재사용하여
+                            # 불필요한 저자 역추적 LLM 호출을 생략한다 (토큰 절약).
+                            pre_extracted_author = next(
+                                (r.get("author") for r in new_results
+                                 if r.get("book_title") == book_title and r.get("author")),
+                                None,
+                            )
+                            author = pre_extracted_author or lookup_author(book_title, provider_verify_prefetch)
                             book_author_map[book_title] = author
                             ensure_book_factsheet_cached(
                                 book_title, author, provider_verify_prefetch,
@@ -1536,10 +1573,23 @@ def get_book_inventory():
     book_cache = load_book_cache()
     items = []
     for cache_key, entry in book_cache.items():
+        book_title_raw = entry.get("book_title", "") or ""
+        author_raw = (entry.get("author") or "").strip()
+
+        # 하위 호환: 과거에 '도서명(저자명)' 파싱 이전에 저장되어 author가 비어있거나
+        # "Unknown"으로 남은 레코드는 조회 시점에 비파괴적으로 재분리하여 표시한다.
+        if not author_raw or author_raw.lower() == "unknown":
+            parsed_title, parsed_author = parse_book_title_author(book_title_raw)
+            display_title = parsed_title or book_title_raw
+            display_author = parsed_author or author_raw
+        else:
+            display_title = book_title_raw
+            display_author = author_raw
+
         items.append({
             "cache_key": cache_key,
-            "book_title": entry.get("book_title", ""),
-            "author": entry.get("author", ""),
+            "book_title": display_title,
+            "author": display_author,
             "updated_at": entry.get("updated_at", ""),
             "is_enriched": bool(entry.get("is_enriched", False)),
         })
