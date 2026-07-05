@@ -113,8 +113,15 @@ def run_stage2(
     provider: LLMProvider,
     config: dict,
     check_cb = None,
+    on_item_done = None,
 ) -> list[dict]:
-    """2단계 LLM 스크리닝을 실행한다."""
+    """2단계 LLM 스크리닝을 실행한다.
+
+    각 제출물은 독립된 단일 API 호출로 처리되며, 이전 학생의 대화 기록이나
+    컨텍스트를 이어받지 않는다 (Stateless per-student — 할루시네이션 전이 차단).
+    항목 처리가 끝날 때마다 on_item_done(sub)을 호출하여 상위 레이어(UI/영속화)가
+    실시간으로 반응할 수 있도록 한다.
+    """
     total = len(submissions)
     consecutive_errors = 0
     last_error_msg = ""
@@ -137,9 +144,11 @@ def run_stage2(
                 "fact_claims": [],
                 "rationale": "빈 텍스트",
             }
+            if on_item_done:
+                on_item_done(sub)
             continue
 
-        # 첫 번째 시도
+        # 매 학생마다 신규 독립 요청 (이전 학생의 응답/컨텍스트를 전달하지 않음)
         parsed, err_msg, is_json_err = _call_and_parse_with_error(provider, text)
 
         # 파싱 실패 시 1회 재시도 (총 2회 제한)
@@ -155,7 +164,7 @@ def run_stage2(
                 logger.error("[2단계] %s — API 호출 에러 (%d/3): %s", filename, consecutive_errors, err_msg)
                 if consecutive_errors >= 3:
                     raise Exception(f"연속 3회 API 에러 발생으로 중단됨. 최근 에러: {err_msg}")
-            
+
             sub["ai_score"] = 0
             sub["stage2"] = {
                 "risk_score": 0,
@@ -166,11 +175,15 @@ def run_stage2(
                 "error": True,
                 "error_message": err_msg
             }
+            if on_item_done:
+                on_item_done(sub)
             continue
 
         consecutive_errors = 0
         sub["ai_score"] = parsed["risk_score"]
         sub["stage2"] = parsed
+        if on_item_done:
+            on_item_done(sub)
 
     return submissions
 

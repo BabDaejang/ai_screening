@@ -163,6 +163,58 @@ def normalize_cache_key(title: str, author: str) -> str:
     cleaned_author = re.sub(r'[\s\\/:*?"<>|]', '', author).strip()
     return f"{cleaned_title}_{cleaned_author}"
 
+# -------------------------------------------------------------
+# 2단계 스크리닝 결과 Append-Only 영속화 & 체크포인트-재개(Resume) 엔진
+# (screening_results.jsonl)
+# -------------------------------------------------------------
+RESULTS_JSONL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screening_results.jsonl")
+
+def load_completed_results() -> dict:
+    """screening_results.jsonl을 스캔하여 이미 완료된 [학번_성명] 인덱스를 로드합니다.
+
+    손상된 라인은 건너뛰고 계속 진행합니다 (Fault Tolerance). 반환된 딕셔너리는
+    이후 루프 진입 전 `if target in completed_map: skip` 판단에 사용되어
+    중복 API 호출과 토큰 낭비를 원천 차단합니다.
+    """
+    completed: dict = {}
+    if not os.path.exists(RESULTS_JSONL_PATH):
+        return completed
+    try:
+        with open(RESULTS_JSONL_PATH, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning(f"screening_results.jsonl 손상된 라인 스킵 (line {line_no})")
+                    continue
+                student_key = record.get("student")
+                if student_key:
+                    completed[student_key] = record
+    except OSError as e:
+        logger.error(f"screening_results.jsonl 로드 실패: {e}")
+    return completed
+
+def append_screening_result(result: dict):
+    """피실험자 1명(Atomic Unit)의 최종 스크리닝 결과를 즉시 행 단위로 append-only 영속화합니다.
+
+    전역 버퍼를 거치지 않고 디스크에 즉시 flush + fsync하여, 사용자가 프로세스를
+    강제 종료하더라도 이미 완료된 데이터는 유실되지 않도록 보장합니다.
+    """
+    try:
+        with open(RESULTS_JSONL_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(result, ensure_ascii=False, default=str) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        student = result.get("student", "?")
+        msg = f"[SUCCESS: Saved Screening Result for {student} to screening_results.jsonl]"
+        print(msg)
+        add_log(msg)
+    except OSError as e:
+        logger.error(f"screening_results.jsonl 저장 실패: {e}")
+
 def lookup_author(book_title: str, provider) -> str:
     """책 제목을 기반으로 AI 모델을 호출하여 원작자/저자명을 역추적(Reverse Lookup)합니다."""
     if not book_title or book_title.lower() == "unknown":
@@ -639,7 +691,7 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
             raise Exception("제출물 파일이 발견되지 않았습니다. 지원 형식: Excel, CSV, PDF, TXT, DOCX")
             
         add_log(f"✅ {len(submissions)}개 제출물 로드 완료.")
-        
+
         # docx 메타데이터 추출
         update_progress(15, "메타데이터 추출 중...")
         for sub in submissions:
@@ -648,171 +700,249 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                 sub["metadata"] = extract_docx_metadata(sub["file_path"])
             else:
                 sub["metadata"] = None
-                
+
         # CostTracker 설정
         cost_tracker = CostTracker(config)
-        
-        # 1단계 규칙 기반 검사
-        update_progress(25, "1단계: 규칙 기반 검사 중...")
-        results = []
-        for i, sub in enumerate(submissions, 1):
-            check_control_state("1단계", i, len(submissions), sub["student"])
-            add_log(f"[1단계] ({i}/{len(submissions)}) {sub['student']} 검사 중...")
-            stage1_res = run_stage1(sub["text"], sub["metadata"], sub["filename"], config)
-            res_item = {
-                "student": sub["student"],
-                "text": sub["text"],
-                "file_type": sub["file_type"],
-                "file_path": sub["file_path"],
-                "metadata": sub["metadata"],
-                "rule_score": stage1_res["rule_score"],
-                "rule_details": stage1_res["details"]
-            }
-            results.append(res_item)
-            
-        # 2단계 AI 스크리닝
-        update_progress(45, "2단계: AI 문체 스크리닝 중...")
-        add_log(f"[2단계] LLM 스크리닝 시작 (모델: {req.screening_provider}/{req.screening_model})")
-        
-        provider_screening = create_provider(
-            provider_name=req.screening_provider,
-            api_key=screening_key,
-            model_screening=req.screening_model,
-            model_verify="",  # 사용되지 않음
-            cost_tracker=cost_tracker
-        )
-        
-        submissions_to_screen = []
-        for r in results:
-            submissions_to_screen.append({
-                "student": r["student"],
-                "filename": r["student"],
-                "text": r["text"]
-            })
-            
-        screened_submissions = run_stage2(submissions_to_screen, provider_screening, config, check_cb=check_control_state)
-        
-        # 2단계 결과를 results에 머지
-        for r, screened in zip(results, screened_submissions):
-            r["ai_score"] = screened.get("ai_score", 0)
-            stage2_info = screened.get("stage2", {})
-            r["stage2"] = stage2_info
-            if stage2_info.get("error"):
-                add_log(f"⚠️ 경고: {r['student']} 학생의 스크리닝 중 오류가 발생했습니다. (사유: {stage2_info.get('rationale')})")
-            
-        # 등급 1차 임시 산출
-        results = calculate_tiers(results, config.get("tier", {}).get("threshold_percentile", 30))
-        
-        # 3단계 사실 검증 대상자 선별
-        update_progress(70, "3단계: 사실 검증 및 팩트시트 대조 중...")
-        candidates = []
-        if req.verify_all:
-            candidates = results
-            add_log("[3단계] 모든 학생을 대상으로 검증을 진행합니다.")
-        elif req.no_verify:
-            add_log("[3단계] 옵션에 의해 사실 검증을 생략합니다.")
+
+        # -----------------------------------------------------------------
+        # 체크포인트-재개(Resume) 로직: screening_results.jsonl 스캔 → 완료 인덱스 로드
+        # 매 루프 진입 전 [학번_성명]이 완료 인덱스에 있으면 전체 파이프라인을 스킵하여
+        # 중복 API 호출 및 토큰 낭비를 원천 차단한다 (Token Waste Zero).
+        # -----------------------------------------------------------------
+        update_progress(20, "체크포인트 스캔 중 (이전 실행 결과 확인)...")
+        completed_map = load_completed_results()
+
+        resumed_results = []
+        submissions_to_process = []
+        for sub in submissions:
+            if sub["student"] in completed_map:
+                resumed_results.append(completed_map[sub["student"]])
+            else:
+                submissions_to_process.append(sub)
+
+        if resumed_results:
+            add_log(f"🔁 체크포인트 발견: {len(resumed_results)}명은 이전에 이미 완료되어 스킵합니다 (중복 API 호출/토큰 소모 0).")
+        add_log(f"▶️ 신규 처리 대상: {len(submissions_to_process)}명")
+
+        # UI State Synchronization: 재개된 결과를 [선별 결과 목록]에 즉시 반영
+        with state_lock:
+            analysis_state["results"] = list(resumed_results)
+
+        new_results: list = []
+
+        def _finalize_and_persist_student(r: dict):
+            """피실험자 1명(Atomic Unit)의 처리가 최종 완료되는 즉시 로컬 파일에
+            append-only로 영속화하고, 동시에 상위 UI 레이어에 실시간으로 반영한다."""
+            append_screening_result(r)
+            with state_lock:
+                analysis_state["results"] = resumed_results + list(new_results)
+
+        if not submissions_to_process:
+            add_log("✅ 모든 대상이 체크포인트에 이미 존재하여 신규 스크리닝을 생략합니다.")
         else:
-            candidates = [r for r in results if r.get("tier") in ("상", "최우선")]
-            add_log(f"[3단계] 선별 대상자: {len(candidates)}명")
-            
-        if candidates and not req.no_verify:
-            add_log(f"[3단계] 사실 검증 시작 (모델: {req.verify_provider}/{req.verify_model})")
-            
-            provider_verify = create_provider(
-                provider_name=req.verify_provider,
-                api_key=verify_key,
-                model_screening="",  # 사용되지 않음
-                model_verify=req.verify_model,
+            # 1단계 규칙 기반 검사 (신규 대상만)
+            update_progress(25, "1단계: 규칙 기반 검사 중...")
+            for i, sub in enumerate(submissions_to_process, 1):
+                check_control_state("1단계", i, len(submissions_to_process), sub["student"])
+                add_log(f"[1단계] ({i}/{len(submissions_to_process)}) {sub['student']} 검사 중...")
+                stage1_res = run_stage1(sub["text"], sub["metadata"], sub["filename"], config)
+                res_item = {
+                    "student": sub["student"],
+                    "text": sub["text"],
+                    "file_type": sub["file_type"],
+                    "file_path": sub["file_path"],
+                    "metadata": sub["metadata"],
+                    "rule_score": stage1_res["rule_score"],
+                    "rule_details": stage1_res["details"]
+                }
+                new_results.append(res_item)
+
+                # UI State Synchronization: 대상 식별 및 도서 매핑 완료 즉시 반영
+                with state_lock:
+                    analysis_state["results"] = resumed_results + list(new_results)
+
+            # 2단계 AI 스크리닝 (신규 대상만)
+            update_progress(45, "2단계: AI 문체 스크리닝 중...")
+            add_log(f"[2단계] LLM 스크리닝 시작 (모델: {req.screening_provider}/{req.screening_model})")
+
+            provider_screening = create_provider(
+                provider_name=req.screening_provider,
+                api_key=screening_key,
+                model_screening=req.screening_model,
+                model_verify="",  # 사용되지 않음
                 cost_tracker=cost_tracker
             )
-            
-            factsheets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "factsheets")
-            os.makedirs(factsheets_dir, exist_ok=True)
-            
-            # book_cache.json 로드
-            book_cache = load_book_cache()
-            
-            for cand in candidates:
-                book_title = None
-                try:
-                    # 1. 도서명 확보
-                    book_title = cand.get("stage2", {}).get("book_title") or cand.get("book_title")
-                    if not book_title or book_title.lower() == "unknown":
-                        continue
-                    
-                    # 2. 저자명 자동 추적 및 메타데이터 보완 (Author Auto-Correction)
-                    author = cand.get("stage2", {}).get("author") or cand.get("author")
-                    if not author or author.strip() == "":
-                        add_log(f"🔍 '{book_title}' 도서의 저자 정보 누락 감지. 저자 역추적 중...")
-                        author = lookup_author(book_title, provider_verify)
-                        add_log(f"✅ 저자 추적 완료: '{book_title}' -> '{author}'")
-                        
-                        # 데이터 구조에 강제 업데이트하여 데이터 유실 방지
-                        if "stage2" not in cand:
-                            cand["stage2"] = {}
-                        cand["stage2"]["author"] = author
-                        cand["author"] = author
-                    
-                    # 3. 고유 키(Key) 생성
-                    cache_key = normalize_cache_key(book_title, author)
-                    
-                    # 4. 캐시 조회 및 실시간 업데이트 (On-the-fly)
-                    if cache_key in book_cache:
-                        # [케이스 A: 캐시 히트 (Key 존재)]
-                        add_log(f"💾 캐시 히트! '{cache_key}' 도서 정보를 book_cache.json에서 불러옵니다. (토큰 0)")
-                        factsheet_content = book_cache[cache_key].get("factsheet", "")
-                    else:
-                        # [케이스 B: 캐시 미스 (Key 부재)]
-                        if req.no_web:
-                            add_log(f"🌐 캐시 미스했으나 no_web 옵션 활성화 상태로 생략: {cache_key}")
-                            factsheet_content = ""
+
+            results_by_student = {r["student"]: r for r in new_results}
+            submissions_to_screen = []
+            for r in new_results:
+                submissions_to_screen.append({
+                    "student": r["student"],
+                    "filename": r["student"],
+                    "text": r["text"]
+                })
+
+            def _on_stage2_item_done(screened_sub: dict):
+                """학생 1명의 2단계 스크리닝이 끝날 때마다 즉시 결과에 반영하고 UI를 갱신한다.
+                각 호출은 완전히 독립된 신규 API 요청의 결과이므로, 다음 학생 처리에
+                이전 학생의 판정이나 대화 맥락이 전혀 영향을 주지 않는다 (할루시네이션 전이 차단)."""
+                r = results_by_student.get(screened_sub["student"])
+                if r is None:
+                    return
+                r["ai_score"] = screened_sub.get("ai_score", 0)
+                stage2_info = screened_sub.get("stage2", {})
+                r["stage2"] = stage2_info
+                if stage2_info.get("error"):
+                    add_log(f"⚠️ 경고: {r['student']} 학생의 스크리닝 중 오류가 발생했습니다. (사유: {stage2_info.get('rationale')})")
+                with state_lock:
+                    analysis_state["results"] = resumed_results + list(new_results)
+
+            run_stage2(
+                submissions_to_screen, provider_screening, config,
+                check_cb=check_control_state, on_item_done=_on_stage2_item_done,
+            )
+
+            # 등급 산출: 재개된 항목까지 포함한 전체 점수 분포를 기준으로 백분위를 계산하되,
+            # 재개된 항목은 이미 확정(immutable)된 체크포인트이므로 원래 tier를 그대로 보존한다.
+            resumed_tier_map = {student: rec.get("tier") for student, rec in completed_map.items()}
+            calculate_tiers(resumed_results + new_results, config.get("tier", {}).get("threshold_percentile", 30))
+            for r in resumed_results:
+                original_tier = resumed_tier_map.get(r["student"])
+                if original_tier is not None:
+                    r["tier"] = original_tier
+
+            with state_lock:
+                analysis_state["results"] = resumed_results + list(new_results)
+
+            # 3단계 사실 검증 대상자 선별 (신규 처리 대상 중에서만, no_verify가 최우선)
+            update_progress(70, "3단계: 사실 검증 및 팩트시트 대조 중...")
+            if req.no_verify:
+                add_log("[3단계] 옵션에 의해 사실 검증을 생략합니다.")
+                candidates = []
+            elif req.verify_all:
+                candidates = list(new_results)
+                add_log("[3단계] 모든 신규 학생을 대상으로 검증을 진행합니다.")
+            else:
+                candidates = [r for r in new_results if r.get("tier") in ("상", "최우선")]
+                add_log(f"[3단계] 선별 대상자: {len(candidates)}명")
+
+            candidate_keys = {c["student"] for c in candidates}
+            non_candidates = [r for r in new_results if r["student"] not in candidate_keys]
+
+            if candidates:
+                add_log(f"[3단계] 사실 검증 시작 (모델: {req.verify_provider}/{req.verify_model})")
+
+                provider_verify = create_provider(
+                    provider_name=req.verify_provider,
+                    api_key=verify_key,
+                    model_screening="",  # 사용되지 않음
+                    model_verify=req.verify_model,
+                    cost_tracker=cost_tracker
+                )
+
+                factsheets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "factsheets")
+                os.makedirs(factsheets_dir, exist_ok=True)
+
+                # book_cache.json (Fact Sheet 레지스트리) 로드
+                book_cache = load_book_cache()
+
+                for cand in candidates:
+                    book_title = None
+                    try:
+                        # 1. 도서명 확보
+                        book_title = cand.get("stage2", {}).get("book_title") or cand.get("book_title")
+                        if not book_title or book_title.lower() == "unknown":
+                            continue
+
+                        # 2. 저자명 자동 추적 및 메타데이터 보완 (Author Auto-Correction)
+                        author = cand.get("stage2", {}).get("author") or cand.get("author")
+                        if not author or author.strip() == "":
+                            add_log(f"🔍 '{book_title}' 도서의 저자 정보 누락 감지. 저자 역추적 중...")
+                            author = lookup_author(book_title, provider_verify)
+                            add_log(f"✅ 저자 추적 완료: '{book_title}' -> '{author}'")
+
+                            # 데이터 구조에 강제 업데이트하여 데이터 유실 방지
+                            if "stage2" not in cand:
+                                cand["stage2"] = {}
+                            cand["stage2"]["author"] = author
+                            cand["author"] = author
+
+                        # 3. 고유 키(Key) 생성
+                        cache_key = normalize_cache_key(book_title, author)
+
+                        # 4. Fact Sheet Cache-Look-up (CASE A/B 분기)
+                        if cache_key in book_cache:
+                            # CASE A (로컬에 존재): 재생성 생략, 캐시된 팩트시트 재사용
+                            add_log(f"💾 캐시 히트! '{cache_key}' 도서 정보를 book_cache.json에서 불러옵니다. (토큰 0)")
+                            factsheet_content = book_cache[cache_key].get("factsheet", "")
                         else:
-                            add_log(f"🌐 캐시 미스! '{cache_key}' 도서의 팩트시트를 생성합니다. (웹 검색/LLM 가동)")
-                            factsheet_content = provider_verify.generate_factsheet(book_title)
-                            
-                            # 전역 캐시 딕셔너리에 추가 및 즉시 병합 저장 (Write-Through)
-                            book_cache[cache_key] = {
-                                "book_title": book_title,
-                                "author": author,
-                                "factsheet": factsheet_content,
-                                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
-                            }
-                            save_book_cache(book_cache)
-                            add_log(f"💾 '{cache_key}' 도서 정보를 book_cache.json에 저장 완료.")
-                    
-                    # 5. 로컬 팩트시트 파일 생성 (stages.stage3_verify와의 연동용)
-                    if factsheet_content:
-                        normalized_title = _normalize_title(book_title)
-                        if normalized_title:
-                            filepath = os.path.join(factsheets_dir, f"{normalized_title}.md")
-                            with open(filepath, "w", encoding="utf-8") as f:
-                                f.write(factsheet_content)
-                except Exception as ex:
-                    # Defensive: 특정 항목 대조 중 에러가 나더라도 continue로 강제 진행
-                    logger.error(f"도서 '{book_title}' 사실검증 캐싱 준비 에러 (루프 계속 진행): {ex}")
-                    continue
-            
-            run_stage3(candidates, provider_verify, factsheets_dir, config, req.no_web, check_cb=check_control_state)
-            
-            # 3단계 결과를 원래 results에 반영
-            candidate_map = {c["student"]: c for c in candidates}
-            for r in results:
-                if r["student"] in candidate_map:
-                    c = candidate_map[r["student"]]
-                    s3 = c.get("stage3", {})
+                            # CASE B (로컬에 부재): 팩트시트 생성 태스크 즉시 트리거
+                            if req.no_web:
+                                add_log(f"🌐 캐시 미스했으나 no_web 옵션 활성화 상태로 생략: {cache_key}")
+                                factsheet_content = ""
+                            else:
+                                add_log(f"🌐 캐시 미스! '{cache_key}' 도서의 팩트시트를 생성합니다. (웹 검색/LLM 가동)")
+                                factsheet_content = provider_verify.generate_factsheet(book_title)
+
+                                # Checkpoint Saving: 전역 캐시 딕셔너리에 즉시 병합 저장 (Write-Through)
+                                book_cache[cache_key] = {
+                                    "book_title": book_title,
+                                    "author": author,
+                                    "factsheet": factsheet_content,
+                                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+                                }
+                                save_book_cache(book_cache)
+                                success_msg = f"[SUCCESS: Saved Fact Sheet for {book_title} to local file]"
+                                print(success_msg)
+                                add_log(success_msg)
+
+                        # 5. 로컬 팩트시트 파일 생성 (stages.stage3_verify와의 연동용)
+                        if factsheet_content:
+                            normalized_title = _normalize_title(book_title)
+                            if normalized_title:
+                                filepath = os.path.join(factsheets_dir, f"{normalized_title}.md")
+                                with open(filepath, "w", encoding="utf-8") as f:
+                                    f.write(factsheet_content)
+                    except Exception as ex:
+                        # Defensive: 특정 항목 대조 중 에러가 나더라도 continue로 강제 진행
+                        logger.error(f"도서 '{book_title}' 사실검증 캐싱 준비 에러 (루프 계속 진행): {ex}")
+                        continue
+
+                def _on_stage3_item_done(cand: dict):
+                    """피실험자 1명의 3단계 검증이 끝나는 즉시(Atomic Unit 완료) 최종 결과를 확정하고
+                    append-only로 영속화 및 UI에 실시간 반영한다. 각 검증은 독립된 API 호출이므로
+                    이 학생의 판정이 다음 학생 처리에 전혀 영향을 주지 않는다 (할루시네이션 전이 차단)."""
+                    s3 = cand.get("stage3", {})
                     if s3.get("error"):
-                        add_log(f"⚠️ 경고: {r['student']} 학생의 사실 검증 중 오류가 발생했습니다. (사유: {s3.get('overall')})")
+                        add_log(f"⚠️ 경고: {cand['student']} 학생의 사실 검증 중 오류가 발생했습니다. (사유: {s3.get('overall')})")
                     claims = s3.get("claims", [])
                     contradiction_count = sum(1 for cl in claims if cl.get("verdict") == "모순")
-                    r.update({
-                        "stage3": s3,
-                        "contradictions": contradiction_count,
-                        "hallucination_score": s3.get("hallucination_score", 0),
-                        "interview_questions": s3.get("interview_questions", []),
-                    })
+                    cand["contradictions"] = contradiction_count
+                    cand["hallucination_score"] = s3.get("hallucination_score", 0)
+                    cand["interview_questions"] = s3.get("interview_questions", [])
                     if contradiction_count > 0:
-                        r["tier"] = "최우선"
-                        
+                        cand["tier"] = "최우선"
+
+                    _finalize_and_persist_student(cand)
+
+                run_stage3(
+                    candidates, provider_verify, factsheets_dir, config, req.no_web,
+                    check_cb=check_control_state, on_item_done=_on_stage3_item_done,
+                )
+
+            # 3단계 대상이 아닌 학생은 2단계 완료 및 등급 확정 시점에 이미 Atomic Unit 처리가
+            # 끝난 것이므로 즉시 확정 및 영속화한다.
+            for r in non_candidates:
+                _finalize_and_persist_student(r)
+
+        # 재개된 결과 + 신규 처리 결과 병합 (원본 제출 순서 유지)
+        results_by_student_final = {r["student"]: r for r in (resumed_results + new_results)}
+        results = [
+            results_by_student_final[s["student"]]
+            for s in submissions
+            if s["student"] in results_by_student_final
+        ]
+
         # 7. 최종 데이터 포맷팅 및 CSV 준비
         update_progress(90, "최종 결과 리포트 작성 중...")
         output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")

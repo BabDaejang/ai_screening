@@ -865,6 +865,9 @@ document.addEventListener("DOMContentLoaded", () => {
                         .replace(/^>\s*/, "");
                     centerFrameDetail.textContent = cleanLog;
                 }
+
+                // [선별 결과 목록] 실시간 반영: 완료된 학생이 생길 때마다 즉시 테이블에 노출
+                await refreshLiveResults();
             }
 
             // 일시정지 상태에 따른 UI 제어
@@ -931,10 +934,10 @@ document.addEventListener("DOMContentLoaded", () => {
             const res = await fetch("/api/results");
             const data = await res.json();
             currentResults = data.results || [];
-            
+
             updateStatsWidgets(currentResults, data.cost_summary);
             renderResultsTable(currentResults);
-            
+
             if (currentResults.length > 0) {
                 btnExportCSV.disabled = false;
             } else {
@@ -943,6 +946,21 @@ document.addEventListener("DOMContentLoaded", () => {
 
         } catch (err) {
             console.error("결과 가져오기 에러:", err);
+        }
+    }
+
+    // 분석 진행 중(running/paused)에 [선별 결과 목록]을 실시간으로 갱신한다.
+    // 완료(export 가능) 여부 토글은 건드리지 않고 테이블/통계만 반영한다.
+    async function refreshLiveResults() {
+        try {
+            const res = await fetch("/api/results");
+            const data = await res.json();
+            currentResults = data.results || [];
+
+            updateStatsWidgets(currentResults, data.cost_summary);
+            renderResultsTable(currentResults);
+        } catch (err) {
+            console.error("실시간 결과 갱신 에러:", err);
         }
     }
 

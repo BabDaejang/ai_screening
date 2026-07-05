@@ -94,7 +94,9 @@ def ensure_factsheet(
     try:
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
-        logger.info("[3단계] 팩트시트 저장 완료: %s", filepath)
+        success_msg = f"[SUCCESS: Saved Fact Sheet for {book_title} to local file]"
+        print(success_msg)
+        logger.info(success_msg)
     except OSError as exc:
         logger.warning("[3단계] 팩트시트 저장 실패: %s — %s", filepath, exc)
 
@@ -292,8 +294,15 @@ def run_stage3(
     config: dict,
     no_web: bool,
     check_cb = None,
+    on_item_done = None,
 ) -> list[dict]:
-    """3단계 사실 검증을 실행한다."""
+    """3단계 사실 검증을 실행한다.
+
+    피실험자 1명(candidate)에 대한 검증이 끝날 때마다 on_item_done(cand)을 호출하여
+    상위 레이어(원자적 영속화/실시간 UI 반영)가 즉시 반응할 수 있도록 한다. 각 candidate는
+    독립된 API 호출로 검증되며, 직전 학생의 판정 결과나 대화 맥락을 이어받지 않는다
+    (Stateless per-student — 할루시네이션 전이 차단).
+    """
     # 책 제목별로 그룹핑 (캐시 효율성)
     book_groups: dict[str, list[int]] = defaultdict(list)
     for idx, cand in enumerate(candidates):
@@ -346,6 +355,8 @@ def run_stage3(
                     "interview_questions": [],
                     "factsheet_available": False,
                 }
+                if on_item_done:
+                    on_item_done(cand)
                 continue
 
             # fact_claims가 비어있으면 건너뜀
@@ -357,6 +368,8 @@ def run_stage3(
                     "interview_questions": [],
                     "factsheet_available": True,
                 }
+                if on_item_done:
+                    on_item_done(cand)
                 continue
 
             # 검증 수행
@@ -389,6 +402,8 @@ def run_stage3(
                     "error": True,
                     "error_message": err_msg
                 }
+                if on_item_done:
+                    on_item_done(cand)
                 continue
 
             consecutive_errors = 0
@@ -403,6 +418,9 @@ def run_stage3(
             if has_contradiction:
                 cand["tier"] = "최우선"
                 logger.info("[3단계] %s — 모순 발견, 등급 '최우선' 격상", filename)
+
+            if on_item_done:
+                on_item_done(cand)
 
     return candidates
 
