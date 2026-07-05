@@ -5,7 +5,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from typing import Optional
@@ -23,7 +25,7 @@ from utils.report_generator import generate_csv, generate_report, calculate_tier
 from providers import create_provider
 from stages.stage1_rules import run_stage1
 from stages.stage2_screening import run_stage2
-from stages.stage3_verify import run_stage3, ensure_factsheet
+from stages.stage3_verify import run_stage3, ensure_factsheet, _normalize_title
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -32,7 +34,7 @@ app = FastAPI(title="AI 의심 선별 도구 웹 UI")
 
 # 전역 상태 관리
 analysis_state = {
-    "status": "idle",  # idle, running, completed, error
+    "status": "idle",  # idle, running, completed, error, paused
     "progress": 0,
     "step": "",
     "logs": [],
@@ -41,8 +43,40 @@ analysis_state = {
     "error_message": ""
 }
 
-# 락 객체
+# 락 객체 및 실행 제어 이벤트
 state_lock = threading.Lock()
+stop_event = threading.Event()
+pause_event = threading.Event()
+pause_event.set()
+
+def check_control_state(stage_name: str, current_idx: int, total_count: int, item_id: str):
+    if stop_event.is_set():
+        raise Exception("사용자에 의해 분석이 강제 종료되었습니다.")
+        
+    step_msg = f"[{stage_name}] ({current_idx}/{total_count}) {item_id} 스크리닝 중…"
+    if "3단계" in stage_name:
+        step_msg = step_msg.replace("스크리닝 중…", "검증 중…")
+        
+    if "1단계" in stage_name:
+        progress = 25 + int((current_idx / total_count) * 20)
+    elif "2단계" in stage_name:
+        progress = 45 + int((current_idx / total_count) * 25)
+    else:
+        progress = 70 + int((current_idx / total_count) * 30)
+        
+    update_progress(progress, step_msg)
+    
+    if not pause_event.is_set():
+        add_log(f"⏸️ 분석이 일시정지되었습니다. (현재 대기 항목: {item_id})")
+        with state_lock:
+            analysis_state["status"] = "paused"
+        while not pause_event.is_set():
+            if stop_event.is_set():
+                raise Exception("사용자에 의해 분석이 강제 종료되었습니다.")
+            pause_event.wait(timeout=1.0)
+        with state_lock:
+            analysis_state["status"] = "running"
+        add_log("▶️ 분석이 재개되었습니다.")
 
 def add_log(message: str):
     with state_lock:
@@ -93,27 +127,86 @@ class AnalyzeRequest(BaseModel):
 class RefreshConfigRequest(BaseModel):
     provider: Optional[str] = None
 
+class EnrichRequest(BaseModel):
+    book_title: str
+    author: str
+    verify_provider: Optional[str] = None
+    verify_model: Optional[str] = None
+
+# -------------------------------------------------------------
+# 단일 마스터 파일 기반 도서 정보 캐시 엔진 (book_cache.json)
+# -------------------------------------------------------------
+def load_book_cache() -> dict:
+    """book_cache.json 마스터 파일에서 캐시 딕셔너리를 로드합니다. 손상 시 빈 딕셔너리를 반환합니다."""
+    cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "book_cache.json")
+    if not os.path.exists(cache_path):
+        return {}
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"book_cache.json 로드 실패 (손상 가능성), 신규 생성: {e}")
+        return {}
+
+def save_book_cache(cache_data: dict):
+    """book_cache.json 마스터 파일에 캐시 딕셔너리를 안전하게 저장합니다."""
+    cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "book_cache.json")
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=4)
+    except OSError as e:
+        logger.error(f"book_cache.json 저장 실패: {e}")
+
+def normalize_cache_key(title: str, author: str) -> str:
+    """공백 및 파일 시스템 금지 문자를 제거하여 고유 키를 정형화합니다."""
+    cleaned_title = re.sub(r'[\s\\/:*?"<>|]', '', title).strip()
+    cleaned_author = re.sub(r'[\s\\/:*?"<>|]', '', author).strip()
+    return f"{cleaned_title}_{cleaned_author}"
+
+def lookup_author(book_title: str, provider) -> str:
+    """책 제목을 기반으로 AI 모델을 호출하여 원작자/저자명을 역추적(Reverse Lookup)합니다."""
+    if not book_title or book_title.lower() == "unknown":
+        return "Unknown"
+    
+    system_prompt = "당신은 도서 저자명을 찾고 JSON 형태로만 반환하는 도서 도우미입니다. 반드시 아래 JSON 형식으로만 응답하세요.\n{\n  \"author\": \"저자명\"\n}"
+    try:
+        res = provider.screen(system_prompt, f"도서명: {book_title}")
+        if isinstance(res, dict) and "author" in res and res["author"]:
+            return str(res["author"]).strip()
+    except Exception as e:
+        logger.error(f"저자 역추적 중 에러: {e}")
+    return "Unknown"
+
 # -------------------------------------------------------------
 # 모델 캐시 로드, 저장 및 백그라운드 갱신 헬퍼 함수
 # -------------------------------------------------------------
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models_cache.json")
+models_cache_data = None
 
 def load_models_cache() -> dict:
-    """models_cache.json에서 캐싱된 모델 목록을 로드합니다."""
+    """models_cache.json에서 캐싱된 모델 목록을 로드합니다. (메모리 캐싱 활용)"""
+    global models_cache_data
+    if models_cache_data is not None:
+        return models_cache_data
     if not os.path.exists(CACHE_FILE):
-        return {}
+        models_cache_data = {}
+        return models_cache_data
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f) or {}
+            models_cache_data = json.load(f) or {}
+            return models_cache_data
     except Exception as e:
         logger.error(f"모델 캐시 로드 실패: {e}")
-        return {}
+        models_cache_data = {}
+        return models_cache_data
 
 def save_models_cache(cache_data: dict):
     """models_cache.json에 모델 캐시를 저장합니다. 기존 캐시와 병합합니다."""
+    global models_cache_data
     try:
         existing = load_models_cache()
         existing.update(cache_data)
+        models_cache_data = existing
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(existing, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -404,41 +497,121 @@ def refresh_config(req: Optional[RefreshConfigRequest] = None):
 # -------------------------------------------------------------
 @app.get("/api/pick-folder")
 def pick_folder(initial: str = ""):
-    """tkinter를 사용해 네이티브 OS 폴더 선택 창을 열고 선택된 경로를 반환합니다."""
-    import threading
-    result = {"path": None, "error": None}
-    ready = threading.Event()
+    """서브프로세스에서 tkinter를 사용해 네이티브 OS 폴더 선택 창을 열고 선택된 경로를 반환합니다."""
+    import subprocess
+    import sys
+    
+    script = f"""
+import tkinter as tk
+from tkinter import filedialog
+import os
 
-    def _open_dialog():
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()                    # 메인 윈도우 숨기기
-            root.attributes("-topmost", True)  # 항상 최상단 표시
-            start_dir = initial if initial and os.path.isdir(initial) else os.path.expanduser("~")
-            selected = filedialog.askdirectory(
-                parent=root,
-                title="제출물 폴더를 선택하세요",
-                initialdir=start_dir,
-                mustexist=True,
-            )
-            root.destroy()
-            if selected:
-                result["path"] = selected.replace("/", "\\")
-        except Exception as e:
-            result["error"] = str(e)
-        finally:
-            ready.set()
+root = tk.Tk()
+root.withdraw()
+root.attributes("-topmost", True)
 
-    t = threading.Thread(target=_open_dialog, daemon=True)
-    t.start()
-    ready.wait(timeout=120)  # 최대 2분 대기
+initial = {repr(initial)}
+start_dir = initial if initial and os.path.isdir(initial) else os.path.expanduser("~")
 
-    if result["error"]:
-        raise HTTPException(status_code=500, detail=f"폴더 선택 창 오류: {result['error']}")
+selected = filedialog.askdirectory(
+    title="제출물 폴더를 선택하세요",
+    initialdir=start_dir,
+    mustexist=True
+)
+if selected:
+    print(selected.replace("/", "\\\\"), end="")
+"""
+    try:
+        encoding_type = "cp949" if sys.platform == "win32" else "utf-8"
+        res = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            encoding=encoding_type,
+            errors="ignore",
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        )
+        if res.returncode != 0:
+            err_msg = res.stderr.strip() if res.stderr else f"Exit code: {res.returncode}"
+            logger.error(f"폴더 선택 서브프로세스 실패: {err_msg}")
+            raise HTTPException(status_code=500, detail=f"폴더 선택 탐색기 실행 실패: {err_msg}")
+            
+        path = res.stdout.strip() if res.stdout else None
+        return {"path": path}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"폴더 선택 에러: {e}")
+        raise HTTPException(status_code=500, detail=f"폴더 선택 에러: {e}")
 
-    return {"path": result["path"]}  # 취소 시 path=null
+
+@app.get("/api/pick-file")
+def pick_file(initial: str = ""):
+    """서브프로세스에서 tkinter를 사용해 네이티브 OS 파일 선택 창을 열고 선택된 다중 경로를 반환합니다."""
+    import subprocess
+    import sys
+    
+    script = f"""
+import tkinter as tk
+from tkinter import filedialog
+import os
+
+root = tk.Tk()
+root.withdraw()
+root.attributes("-topmost", True)
+
+initial = {repr(initial)}
+if initial:
+    # 다중 경로 구분자인 세미콜론이 있으면 첫 번째 파일 경로 기준으로 폴더 결정
+    first_path = initial.split(";")[0].strip()
+    if os.path.isdir(first_path):
+        start_dir = first_path
+    elif os.path.isfile(first_path):
+        start_dir = os.path.dirname(first_path)
+    else:
+        start_dir = os.path.expanduser("~")
+else:
+    start_dir = os.path.expanduser("~")
+
+selected = filedialog.askopenfilenames(
+    title="제출물 파일들을 선택하세요",
+    initialdir=start_dir,
+    filetypes=[
+        ("모든 지원 파일", "*.txt *.docx *.pdf *.xlsx *.xls *.csv"),
+        ("텍스트 파일 (*.txt)", "*.txt"),
+        ("Word 문서 (*.docx)", "*.docx"),
+        ("PDF 문서 (*.pdf)", "*.pdf"),
+        ("Excel 통합 문서 (*.xlsx *.xls)", "*.xlsx *.xls"),
+        ("CSV 파일 (*.csv)", "*.csv"),
+        ("모든 파일 (*.*)", "*.*")
+    ]
+)
+if selected:
+    paths = ";".join(selected)
+    print(paths.replace("/", "\\\\"), end="")
+"""
+    try:
+        encoding_type = "cp949" if sys.platform == "win32" else "utf-8"
+        res = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            encoding=encoding_type,
+            errors="ignore",
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        )
+        if res.returncode != 0:
+            err_msg = res.stderr.strip() if res.stderr else f"Exit code: {res.returncode}"
+            logger.error(f"파일 선택 서브프로세스 실패: {err_msg}")
+            raise HTTPException(status_code=500, detail=f"파일 선택 탐색기 실행 실패: {err_msg}")
+            
+        path = res.stdout.strip() if res.stdout else None
+        return {"path": path}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"파일 선택 에러: {e}")
+        raise HTTPException(status_code=500, detail=f"파일 선택 에러: {e}")
 
 
 # -------------------------------------------------------------
@@ -463,7 +636,7 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
             
         submissions = read_submissions(req.submissions_dir)
         if not submissions:
-            raise Exception("제출물 파일(.txt, .docx)이 발견되지 않았습니다.")
+            raise Exception("제출물 파일이 발견되지 않았습니다. 지원 형식: Excel, CSV, PDF, TXT, DOCX")
             
         add_log(f"✅ {len(submissions)}개 제출물 로드 완료.")
         
@@ -483,6 +656,7 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
         update_progress(25, "1단계: 규칙 기반 검사 중...")
         results = []
         for i, sub in enumerate(submissions, 1):
+            check_control_state("1단계", i, len(submissions), sub["student"])
             add_log(f"[1단계] ({i}/{len(submissions)}) {sub['student']} 검사 중...")
             stage1_res = run_stage1(sub["text"], sub["metadata"], sub["filename"], config)
             res_item = {
@@ -516,7 +690,7 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                 "text": r["text"]
             })
             
-        screened_submissions = run_stage2(submissions_to_screen, provider_screening, config)
+        screened_submissions = run_stage2(submissions_to_screen, provider_screening, config, check_cb=check_control_state)
         
         # 2단계 결과를 results에 머지
         for r, screened in zip(results, screened_submissions):
@@ -553,7 +727,72 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
             )
             
             factsheets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "factsheets")
-            run_stage3(candidates, provider_verify, factsheets_dir, config, req.no_web)
+            os.makedirs(factsheets_dir, exist_ok=True)
+            
+            # book_cache.json 로드
+            book_cache = load_book_cache()
+            
+            for cand in candidates:
+                book_title = None
+                try:
+                    # 1. 도서명 확보
+                    book_title = cand.get("stage2", {}).get("book_title") or cand.get("book_title")
+                    if not book_title or book_title.lower() == "unknown":
+                        continue
+                    
+                    # 2. 저자명 자동 추적 및 메타데이터 보완 (Author Auto-Correction)
+                    author = cand.get("stage2", {}).get("author") or cand.get("author")
+                    if not author or author.strip() == "":
+                        add_log(f"🔍 '{book_title}' 도서의 저자 정보 누락 감지. 저자 역추적 중...")
+                        author = lookup_author(book_title, provider_verify)
+                        add_log(f"✅ 저자 추적 완료: '{book_title}' -> '{author}'")
+                        
+                        # 데이터 구조에 강제 업데이트하여 데이터 유실 방지
+                        if "stage2" not in cand:
+                            cand["stage2"] = {}
+                        cand["stage2"]["author"] = author
+                        cand["author"] = author
+                    
+                    # 3. 고유 키(Key) 생성
+                    cache_key = normalize_cache_key(book_title, author)
+                    
+                    # 4. 캐시 조회 및 실시간 업데이트 (On-the-fly)
+                    if cache_key in book_cache:
+                        # [케이스 A: 캐시 히트 (Key 존재)]
+                        add_log(f"💾 캐시 히트! '{cache_key}' 도서 정보를 book_cache.json에서 불러옵니다. (토큰 0)")
+                        factsheet_content = book_cache[cache_key].get("factsheet", "")
+                    else:
+                        # [케이스 B: 캐시 미스 (Key 부재)]
+                        if req.no_web:
+                            add_log(f"🌐 캐시 미스했으나 no_web 옵션 활성화 상태로 생략: {cache_key}")
+                            factsheet_content = ""
+                        else:
+                            add_log(f"🌐 캐시 미스! '{cache_key}' 도서의 팩트시트를 생성합니다. (웹 검색/LLM 가동)")
+                            factsheet_content = provider_verify.generate_factsheet(book_title)
+                            
+                            # 전역 캐시 딕셔너리에 추가 및 즉시 병합 저장 (Write-Through)
+                            book_cache[cache_key] = {
+                                "book_title": book_title,
+                                "author": author,
+                                "factsheet": factsheet_content,
+                                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+                            }
+                            save_book_cache(book_cache)
+                            add_log(f"💾 '{cache_key}' 도서 정보를 book_cache.json에 저장 완료.")
+                    
+                    # 5. 로컬 팩트시트 파일 생성 (stages.stage3_verify와의 연동용)
+                    if factsheet_content:
+                        normalized_title = _normalize_title(book_title)
+                        if normalized_title:
+                            filepath = os.path.join(factsheets_dir, f"{normalized_title}.md")
+                            with open(filepath, "w", encoding="utf-8") as f:
+                                f.write(factsheet_content)
+                except Exception as ex:
+                    # Defensive: 특정 항목 대조 중 에러가 나더라도 continue로 강제 진행
+                    logger.error(f"도서 '{book_title}' 사실검증 캐싱 준비 에러 (루프 계속 진행): {ex}")
+                    continue
+            
+            run_stage3(candidates, provider_verify, factsheets_dir, config, req.no_web, check_cb=check_control_state)
             
             # 3단계 결과를 원래 results에 반영
             candidate_map = {c["student"]: c for c in candidates}
@@ -622,9 +861,14 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
     except Exception as e:
         logger.exception("분석 스레드 실패")
         with state_lock:
-            analysis_state["status"] = "error"
-            analysis_state["error_message"] = str(e)
-            analysis_state["step"] = "에러 발생"
+            if "강제 종료" in str(e):
+                analysis_state["status"] = "stopped"
+                analysis_state["step"] = "강제 종료됨"
+                analysis_state["error_message"] = str(e)
+            else:
+                analysis_state["status"] = "error"
+                analysis_state["error_message"] = str(e)
+                analysis_state["step"] = "에러 발생"
         add_log(f"❌ 에러가 발생했습니다: {e}")
 
 @app.post("/api/analyze")
@@ -648,6 +892,8 @@ def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks):
         analysis_state["results"] = []
         analysis_state["cost_summary"] = {}
         analysis_state["error_message"] = ""
+        stop_event.clear()
+        pause_event.set()
         
     config = load_config()
     
@@ -660,6 +906,114 @@ def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks):
     thread.start()
     
     return {"message": "분석 시작"}
+
+@app.post("/api/analyze/pause")
+def pause_analysis():
+    global analysis_state
+    with state_lock:
+        if analysis_state["status"] != "running":
+            raise HTTPException(status_code=400, detail="진행 중인 분석이 없습니다.")
+    pause_event.clear()
+    return {"message": "일시정지 요청 완료"}
+
+@app.post("/api/analyze/resume")
+def resume_analysis():
+    global analysis_state
+    with state_lock:
+        if analysis_state["status"] != "paused":
+            raise HTTPException(status_code=400, detail="일시정지 상태가 아닙니다.")
+    pause_event.set()
+    return {"message": "재개 요청 완료"}
+
+@app.post("/api/analyze/stop")
+def stop_analysis():
+    global analysis_state
+    with state_lock:
+        if analysis_state["status"] not in ("running", "paused"):
+            raise HTTPException(status_code=400, detail="진행 중인 분석이 없습니다.")
+    stop_event.set()
+    pause_event.set()  # 대기 중인 스레드를 깨우기 위함
+    return {"message": "강제 종료 요청 완료"}
+
+@app.post("/api/analyze/reset")
+def reset_analysis():
+    global analysis_state
+    with state_lock:
+        analysis_state["status"] = "idle"
+        analysis_state["error_message"] = ""
+    return {"message": "상태 초기화 완료"}
+
+@app.post("/api/analyze/enrich-factsheet")
+async def enrich_factsheet(req: EnrichRequest):
+    # 1. 로그인 세션 및 API 키 획득
+    session = global_user_manager.get_session_data()
+    if not session:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    api_keys = session.get("api_keys", {})
+
+    config = load_config()
+    provider_name = req.verify_provider or config.get("verify", {}).get("provider", "gemini")
+    model_name = req.verify_model or config.get("verify", {}).get("model", "gemini-2.5-flash")
+
+    api_key = api_keys.get(provider_name)
+    if not api_key:
+        raise HTTPException(status_code=400, detail=f"3단계 검증을 위한 {provider_name} API Key가 등록되지 않았습니다. API 키를 먼저 등록해 주세요.")
+
+    # 1. 전달받은 도서명과 저자명으로 고유 캐시 키 복원
+    cache_key = normalize_cache_key(req.book_title, req.author)
+    
+    # 2. 기존 generate_factsheet보다 훨씬 강력하고 촘촘한 시스템 프롬프트 정의
+    deep_prompt = (
+        f"당신은 도서 '{req.book_title}'({req.author})에 대한 고해상도 사실 검증 전문가입니다. "
+        f"인터넷 검색을 통해 해당 도서 내의 구체적인 핵심 개념, 저자의 핵심 주장, 역사적/과학적 사실적 수치, "
+        f"고유 명사 리스트를 일반적인 수준보다 3배 이상 디테일하고 풍부하게 심층 조사하여 마크다운 포맷의 팩트시트를 재생성하세요."
+    )
+    
+    # 3. LLM 및 검색 엔진을 재가동하여 고밀도 팩트시트 콘텐츠 생성
+    try:
+        cost_tracker = CostTracker(config)
+        provider_verify = create_provider(
+            provider_name=provider_name,
+            api_key=api_key,
+            model_screening="",
+            model_verify=model_name,
+            cost_tracker=cost_tracker
+        )
+        enriched_content = provider_verify.generate_enriched_factsheet(req.book_title, prompt_override=deep_prompt)
+    except Exception as e:
+        logger.error(f"심층 팩트시트 보강 API 에러: {e}")
+        raise HTTPException(status_code=500, detail=f"팩트시트 보강 실패: {str(e)}")
+
+    if not enriched_content or "에러:" in enriched_content or "실패했습니다" in enriched_content:
+         raise HTTPException(status_code=500, detail="LLM이 팩트시트 보강 결과를 생성하지 못했습니다.")
+
+    # 4. 단일 마스터 파일(`book_cache.json`)에서 해당 Key의 데이터만 완벽하게 덮어쓰기(Overwrite) 및 동기화
+    book_cache = load_book_cache()
+    book_cache[cache_key] = {
+        "book_title": req.book_title,
+        "author": req.author,
+        "factsheet": enriched_content,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "is_enriched": True
+    }
+    save_book_cache(book_cache)
+    
+    # 5. 기존의 로컬 factsheets/ 디렉토리 내 마크다운 파일도 즉시 동기화 업데이트
+    try:
+        factsheets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "factsheets")
+        os.makedirs(factsheets_dir, exist_ok=True)
+        normalized_title = _normalize_title(req.book_title)
+        if normalized_title:
+            filepath = os.path.join(factsheets_dir, f"{normalized_title}.md")
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(enriched_content)
+    except Exception as e:
+        logger.warning(f"로컬 factsheet 파일 동기화 저장 실패: {e}")
+
+    # UI 중앙 로그창에 알림 추가
+    add_log(f"⚡ [온디맨드 보강 완료] '{req.book_title}'({req.author}) 도서 팩트시트 심층 보강 완료!")
+
+    return {"status": "success", "message": f"'{req.book_title}' 도서 팩트시트 심층 보강 완료"}
 
 @app.get("/api/analyze/status")
 def get_analysis_status():
@@ -795,6 +1149,16 @@ def open_browser():
 
 if __name__ == "__main__":
     import uvicorn
-    loop = asyncio.get_event_loop()
+    import warnings
+
+    # Trio 또는 기타 프레임워크의 예외 처리기 관련 RuntimeWarning 필터링
+    warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*sys.excepthook.*")
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     loop.call_later(1.0, open_browser)
-    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)

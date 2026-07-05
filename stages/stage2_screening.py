@@ -112,23 +112,19 @@ def run_stage2(
     submissions: list[dict],
     provider: LLMProvider,
     config: dict,
+    check_cb = None,
 ) -> list[dict]:
-    """2단계 LLM 스크리닝을 실행한다.
-
-    Args:
-        submissions: 1단계를 통과한 제출물 리스트.
-            각 항목은 최소 {"filename": str, "text": str} 포함.
-        provider: LLMProvider 구현체 인스턴스.
-        config: 설정 dict (현재 단계에서는 직접 사용하지 않으나 확장성 위해 전달).
-
-    Returns:
-        submissions 리스트 (각 항목에 stage2 결과가 추가됨).
-    """
+    """2단계 LLM 스크리닝을 실행한다."""
     total = len(submissions)
+    consecutive_errors = 0
+    last_error_msg = ""
 
     for idx, sub in enumerate(submissions, 1):
         filename = sub.get("filename", f"submission_{idx}")
         text = sub.get("text", "")
+
+        if check_cb:
+            check_cb("2단계", idx, total, filename)
 
         logger.info("[2단계] (%d/%d) %s 스크리닝 중…", idx, total, filename)
 
@@ -144,56 +140,64 @@ def run_stage2(
             continue
 
         # 첫 번째 시도
-        parsed = _call_and_parse(provider, text)
+        parsed, err_msg, is_json_err = _call_and_parse_with_error(provider, text)
 
-        # 파싱 실패 시 1회 재시도
-        if parsed is None:
-            logger.warning("[2단계] %s — JSON 파싱 실패, 재시도…", filename)
-            parsed = _call_and_parse(provider, text)
+        # 파싱 실패 시 1회 재시도 (총 2회 제한)
+        if parsed is None and is_json_err:
+            logger.warning("[2단계] %s — JSON 파싱 실패, 재시도 (2번째)…", filename)
+            parsed, err_msg, is_json_err = _call_and_parse_with_error(provider, text)
 
         if parsed is None:
-            logger.error("[2단계] %s — 재시도 후에도 파싱 실패 또는 API 에러", filename)
+            if is_json_err:
+                logger.error("[2단계] %s — 2회 연속 JSON 파싱 실패로 해당 항목 스킵: %s", filename, err_msg)
+            else:
+                consecutive_errors += 1
+                logger.error("[2단계] %s — API 호출 에러 (%d/3): %s", filename, consecutive_errors, err_msg)
+                if consecutive_errors >= 3:
+                    raise Exception(f"연속 3회 API 에러 발생으로 중단됨. 최근 에러: {err_msg}")
+            
             sub["ai_score"] = 0
             sub["stage2"] = {
                 "risk_score": 0,
                 "book_title": None,
                 "signals": [],
                 "fact_claims": [],
-                "rationale": "LLM 응답 파싱 실패 또는 API 호출 오류",
+                "rationale": f"JSON 파싱 실패 또는 API 호출 오류: {err_msg}",
                 "error": True,
-                "error_message": "2단계 AI 스크리닝 중 API 에러 혹은 JSON 파싱 실패가 발생했습니다."
+                "error_message": err_msg
             }
             continue
 
+        consecutive_errors = 0
         sub["ai_score"] = parsed["risk_score"]
         sub["stage2"] = parsed
 
     return submissions
 
 
-def _call_and_parse(provider: LLMProvider, text: str) -> dict[str, Any] | None:
-    """프로바이더 호출 후 JSON 파싱까지 수행.
-
-    API 에러 발생 시 None 반환 (크래시 방지).
-    """
+def _call_and_parse_with_error(provider: LLMProvider, text: str) -> tuple[dict[str, Any] | None, str, bool]:
+    """프로바이더 호출 후 JSON 파싱까지 수행하고 (결과, 에러메시지, json_decode_error여부)를 반환합니다."""
     try:
         raw_response = provider.screen(SCREENING_SYSTEM_PROMPT, text)
     except Exception as exc:
-        logger.error("[2단계] API 호출 에러: %s", exc)
-        return None
+        err_msg = str(exc)
+        logger.error("[2단계] API 호출 에러: %s", err_msg)
+        return None, f"API 호출 에러: {err_msg}", False
 
-    # provider.screen이 이미 dict를 반환하는 경우 처리
     if isinstance(raw_response, dict):
-        # 필수 필드 존재 여부 확인
+        if "error" in raw_response and "JSON 파싱" in raw_response.get("error", ""):
+            return None, raw_response["error"], True
         if "risk_score" in raw_response:
             raw_response.setdefault("book_title", None)
             raw_response.setdefault("fact_claims", [])
             raw_response.setdefault("signals", [])
             raw_response.setdefault("rationale", "")
-            return raw_response
+            return raw_response, "", False
 
-    # 문자열 응답인 경우 파싱
     if isinstance(raw_response, str):
-        return _parse_screening_response(raw_response)
+        parsed = _parse_screening_response(raw_response)
+        if parsed is not None:
+            return parsed, "", False
+        return None, f"JSON 파싱 실패 (응답 일부: {raw_response[:100]})", True
 
-    return None
+    return None, "알 수 없는 응답 형식", False

@@ -180,19 +180,20 @@ class AnthropicProvider(LLMProvider):
             logger.error(f"스크리닝 중 예상치 못한 에러: {e}")
             return {"error": str(e)}
 
-    def generate_factsheet(self, book_title: str, max_tokens: int = 2000) -> str:
+    def generate_factsheet(self, book_title: str, prompt_override: Optional[str] = None, max_tokens: int = 2000) -> str:
         """3-1단계: 웹 검색 기반 팩트시트 생성.
 
         Claude의 web_search 도구를 활용하여 도서 정보를 수집하고 팩트시트를 생성.
         """
         try:
             user_prompt = f"다음 도서에 대한 팩트시트를 작성해주세요: 《{book_title}》"
+            system_prompt = prompt_override or _FACTSHEET_SYSTEM_PROMPT
 
             def _api_call():
                 return self.client.messages.create(
                     model=self.model_verify,
                     max_tokens=max_tokens,
-                    system=_FACTSHEET_SYSTEM_PROMPT,
+                    system=system_prompt,
                     tools=[
                         {
                             "type": "web_search_20250305",
@@ -240,6 +241,11 @@ class AnthropicProvider(LLMProvider):
         except Exception as e:
             logger.error(f"팩트시트 생성 중 예상치 못한 에러: {e}")
             return f"# {book_title} 팩트시트\n\n에러: {str(e)}"
+
+    def generate_enriched_factsheet(self, book_title: str, prompt_override: Optional[str] = None, max_tokens: int = 3000) -> str:
+        """app.py의 온디맨드 심층 보강 요청을 받아 토큰 한도를 확장하고 상위 프롬프트로 팩트시트를 재생성합니다."""
+        # 더 깊은 조사를 위해 max_tokens 제약 조건을 기존 2000에서 3000~4000으로 확장하여 부모/기존 메서드 호출
+        return self.generate_factsheet(book_title, prompt_override=prompt_override, max_tokens=max_tokens)
 
     def verify_claims(self, system_prompt: str, claims: list, full_text: str, max_tokens: int = 2000) -> dict:
         """3-2단계: 팩트시트 기반 사실 검증.

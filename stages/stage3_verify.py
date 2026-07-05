@@ -291,20 +291,9 @@ def run_stage3(
     factsheets_dir: str,
     config: dict,
     no_web: bool,
+    check_cb = None,
 ) -> list[dict]:
-    """3단계 사실 검증을 실행한다.
-
-    Args:
-        candidates: 3단계 대상 후보 리스트.
-            각 항목은 stage2 결과(book_title, fact_claims)를 포함해야 한다.
-        provider: LLM 프로바이더 인스턴스.
-        factsheets_dir: 팩트시트 저장 디렉토리 경로.
-        config: 설정 dict.
-        no_web: True이면 웹 검색 없이 캐시만 사용.
-
-    Returns:
-        candidates 리스트 (각 항목에 stage3 결과가 추가됨).
-    """
+    """3단계 사실 검증을 실행한다."""
     # 책 제목별로 그룹핑 (캐시 효율성)
     book_groups: dict[str, list[int]] = defaultdict(list)
     for idx, cand in enumerate(candidates):
@@ -317,15 +306,24 @@ def run_stage3(
 
     total = len(candidates)
     processed = 0
+    consecutive_errors = 0
+    last_error_msg = ""
 
     for book_title, indices in book_groups.items():
         # 팩트시트 확보
-        factsheet = ensure_factsheet(book_title, provider, factsheets_dir, no_web)
+        try:
+            factsheet = ensure_factsheet(book_title, provider, factsheets_dir, no_web)
+        except Exception as exc:
+            factsheet = None
+            logger.error("[3단계] 팩트시트 확보 중 예외 발생: %s", exc)
 
         for idx in indices:
             cand = candidates[idx]
             processed += 1
             filename = cand.get("filename", f"candidate_{idx}")
+
+            if check_cb:
+                check_cb("3단계", processed, total, filename)
 
             logger.info(
                 "[3단계] (%d/%d) %s 검증 중… (도서: %s)",
@@ -362,29 +360,38 @@ def run_stage3(
                 continue
 
             # 검증 수행
-            parsed = _verify_and_parse(
+            parsed, err_msg, is_json_err = _verify_and_parse_with_error(
                 provider, factsheet, fact_claims, full_text,
             )
 
-            # 파싱 실패 시 1회 재시도
-            if parsed is None:
-                logger.warning("[3단계] %s — JSON 파싱 실패, 재시도…", filename)
-                parsed = _verify_and_parse(
+            # 파싱 실패 시 1회 재시도 (총 2회 제한)
+            if parsed is None and is_json_err:
+                logger.warning("[3단계] %s — JSON 파싱 실패, 재시도 (2번째)…", filename)
+                parsed, err_msg, is_json_err = _verify_and_parse_with_error(
                     provider, factsheet, fact_claims, full_text,
                 )
 
             if parsed is None:
-                logger.error("[3단계] %s — 재시도 후에도 파싱 실패", filename)
+                if is_json_err:
+                    logger.error("[3단계] %s — 2회 연속 JSON 파싱 실패로 해당 항목 스킵: %s", filename, err_msg)
+                else:
+                    consecutive_errors += 1
+                    logger.error("[3단계] %s — API 호출 에러 (%d/3): %s", filename, consecutive_errors, err_msg)
+                    if consecutive_errors >= 3:
+                        raise Exception(f"연속 3회 API 에러 발생으로 중단됨. 최근 에러: {err_msg}")
+                
                 cand["stage3"] = {
                     "claims": [],
                     "hallucination_score": 0,
-                    "overall": "LLM 응답 파싱 실패",
+                    "overall": f"JSON 파싱 실패 또는 API 호출 오류: {err_msg}",
                     "interview_questions": [],
                     "factsheet_available": True,
                     "error": True,
+                    "error_message": err_msg
                 }
                 continue
 
+            consecutive_errors = 0
             parsed["factsheet_available"] = True
             cand["stage3"] = parsed
 
@@ -400,16 +407,13 @@ def run_stage3(
     return candidates
 
 
-def _verify_and_parse(
+def _verify_and_parse_with_error(
     provider: LLMProvider,
     factsheet: str,
     fact_claims: list[str],
     full_text: str,
-) -> dict[str, Any] | None:
-    """프로바이더를 통해 검증 수행 후 JSON 파싱.
-
-    API 에러 발생 시 None 반환 (크래시 방지).
-    """
+) -> tuple[dict[str, Any] | None, str, bool]:
+    """프로바이더를 통해 검증 수행 후 JSON 파싱 및 에러 메시지와 json_decode_error 여부 반환."""
     system_prompt = _build_verify_system_prompt(factsheet)
 
     try:
@@ -417,19 +421,23 @@ def _verify_and_parse(
             system_prompt, fact_claims, full_text,
         )
     except Exception as exc:
-        logger.error("[3단계] API 호출 에러: %s", exc)
-        return None
+        err_msg = str(exc)
+        logger.error("[3단계] API 호출 에러: %s", err_msg)
+        return None, f"API 호출 에러: {err_msg}", False
 
-    # provider.verify_claims가 이미 dict를 반환하는 경우
     if isinstance(raw_response, dict):
+        if "error" in raw_response and "JSON 파싱" in raw_response.get("error", ""):
+            return None, raw_response["error"], True
         if "claims" in raw_response:
             raw_response.setdefault("hallucination_score", 0)
             raw_response.setdefault("overall", "")
             raw_response.setdefault("interview_questions", [])
-            return raw_response
+            return raw_response, "", False
 
-    # 문자열 응답인 경우 파싱
     if isinstance(raw_response, str):
-        return _parse_verify_response(raw_response)
+        parsed = _parse_verify_response(raw_response)
+        if parsed is not None:
+            return parsed, "", False
+        return None, f"JSON 파싱 실패 (응답 일부: {raw_response[:100]})", True
 
-    return None
+    return None, "알 수 없는 응답 형식", False

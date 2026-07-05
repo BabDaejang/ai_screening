@@ -5,6 +5,7 @@ let currentProfile = null;
 let availableModels = {};
 let currentResults = [];
 let progressInterval = null;
+let selectedFiles = [];
 
 // 폴더 브라우저 상태
 let folderBrowserState = {
@@ -58,15 +59,21 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // Analysis Panel
     const submissionsDir = document.getElementById("submissionsDir");
-    const btnBrowseFolder = document.getElementById("btnBrowseFolder");
+    const btnBrowseFile = document.getElementById("btnBrowseFile");
+    const selectedFilesBox = document.getElementById("selectedFilesBox");
+    const selectedFilesList = document.getElementById("selectedFilesList");
+    const selectedFilesCount = document.getElementById("selectedFilesCount");
+    const btnClearFiles = document.getElementById("btnClearFiles");
+    const centerStatusOverlay = document.getElementById("centerStatusOverlay");
     const verifyAll = document.getElementById("verifyAll");
     const noVerify = document.getElementById("noVerify");
     const noWeb = document.getElementById("noWeb");
     const btnStartAnalyze = document.getElementById("btnStartAnalyze");
     const progressPanel = document.getElementById("progressPanel");
-    const progressStep = document.getElementById("progressStep");
-    const progressPercent = document.getElementById("progressPercent");
-    const progressBarFill = document.getElementById("progressBarFill");
+    const progressStep = document.getElementById("centerFrameStep");
+    const progressPercent = document.getElementById("centerFramePercent");
+    const progressBarFill = document.getElementById("centerFrameBarFill");
+    const centerFrameDetail = document.getElementById("centerFrameDetail");
     const consoleLogs = document.getElementById("consoleLogs");
 
 
@@ -141,11 +148,67 @@ document.addEventListener("DOMContentLoaded", () => {
     btnCloseRegisterKeyModal.addEventListener("click", () => modalRegisterKey.style.display = "none");
     btnRegisterKeySubmit.addEventListener("click", submitBatchRegisterKeys);
 
-    // 네이티브 폴더 선택 버튼
-    btnBrowseFolder.addEventListener("click", openNativeFolderPicker);
+    if (btnBrowseFile) {
+        btnBrowseFile.addEventListener("click", openNativeFilePicker);
+    }
+
+    if (btnClearFiles) {
+        btnClearFiles.addEventListener("click", () => {
+            selectedFiles = [];
+            updateSelectedFilesUI();
+        });
+    }
 
     // Start Analysis
     btnStartAnalyze.addEventListener("click", startAnalysis);
+
+    // Center Frame Controls
+    const btnPauseFrame = document.getElementById("btnPauseFrame");
+    const btnStopFrame = document.getElementById("btnStopFrame");
+    const btnResetFrame = document.getElementById("btnResetFrame");
+    const pauseFrameBtnText = document.getElementById("pauseFrameBtnText");
+
+    if (btnPauseFrame) {
+        btnPauseFrame.addEventListener("click", async () => {
+            const isPaused = pauseFrameBtnText.textContent.trim() === "재개";
+            const endpoint = isPaused ? "/api/analyze/resume" : "/api/analyze/pause";
+            try {
+                const res = await fetch(endpoint, { method: "POST" });
+                if (!res.ok) {
+                    const data = await res.json();
+                    alert(`요청 실패: ${data.detail}`);
+                }
+            } catch (err) {
+                console.error("일시정지/재개 요청 에러:", err);
+            }
+        });
+    }
+
+    if (btnStopFrame) {
+        btnStopFrame.addEventListener("click", async () => {
+            if (!confirm("현재 진행 중인 분석 작업을 강제 종료하시겠습니까?")) return;
+            try {
+                const res = await fetch("/api/analyze/stop", { method: "POST" });
+                if (!res.ok) {
+                    const data = await res.json();
+                    alert(`요청 실패: ${data.detail}`);
+                }
+            } catch (err) {
+                console.error("강제 종료 요청 에러:", err);
+            }
+        });
+    }
+
+    if (btnResetFrame) {
+        btnResetFrame.addEventListener("click", async () => {
+            try {
+                await fetch("/api/analyze/reset", { method: "POST" });
+            } catch (err) {
+                console.error("초기화 요청 에러:", err);
+            }
+            switchFrameState("idle");
+        });
+    }
 
     // Filter results
     filterTier.addEventListener("change", () => renderResultsTable(currentResults));
@@ -170,45 +233,78 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     });
 
-    // -------------------------------------------------------------
-    // 네이티브 폴더 선택 다이얼로그
-    // -------------------------------------------------------------
-    async function openNativeFolderPicker() {
+    async function openNativeFilePicker() {
         // 버튼 비활성화 + 로딩 표시
-        btnBrowseFolder.disabled = true;
-        const origText = btnBrowseFolder.innerHTML;
-        btnBrowseFolder.innerHTML = `
+        btnBrowseFile.disabled = true;
+        const origText = btnBrowseFile.innerHTML;
+        btnBrowseFile.innerHTML = `
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" style="animation:spin 1s linear infinite">
                 <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
             </svg>
-            열는 중...`;
+            열리는 중...`;
 
         try {
             const currentVal = submissionsDir.value.trim();
             const url = currentVal
-                ? `/api/pick-folder?initial=${encodeURIComponent(currentVal)}`
-                : `/api/pick-folder`;
+                ? `/api/pick-file?initial=${encodeURIComponent(currentVal)}`
+                : `/api/pick-file`;
             const res = await fetch(url);
             if (!res.ok) {
                 const err = await res.json();
-                alert(`폴더 선택 오류: ${err.detail}`);
+                alert(`파일 선택 오류: ${err.detail}`);
                 return;
             }
             const data = await res.json();
             if (data.path) {
-                submissionsDir.value = data.path;
-                // 선택 성공 피드백
-                submissionsDir.style.borderColor = "var(--color-success)";
-                setTimeout(() => { submissionsDir.style.borderColor = ""; }, 1500);
+                const newPaths = data.path.split(';').map(p => p.trim()).filter(p => p);
+                newPaths.forEach(p => {
+                    if (!selectedFiles.includes(p)) {
+                        selectedFiles.push(p);
+                    }
+                });
+                updateSelectedFilesUI();
             }
             // data.path === null 이면 취소 - 조용히 무시
         } catch (err) {
-            console.error("폴더 선택 API 오류:", err);
-            alert("폴더 선택 중 오류가 발생했습니다.");
+            console.error("파일 선택 API 오류:", err);
+            alert("파일 선택 중 오류가 발생했습니다.");
         } finally {
-            btnBrowseFolder.disabled = false;
-            btnBrowseFolder.innerHTML = origText;
+            btnBrowseFile.disabled = false;
+            btnBrowseFile.innerHTML = origText;
         }
+    }
+
+    function updateSelectedFilesUI() {
+        submissionsDir.value = selectedFiles.join(';');
+        
+        if (selectedFiles.length === 0) {
+            selectedFilesBox.style.display = "none";
+            selectedFilesList.innerHTML = "";
+            selectedFilesCount.textContent = "0";
+            return;
+        }
+        
+        selectedFilesBox.style.display = "block";
+        selectedFilesCount.textContent = selectedFiles.length;
+        
+        selectedFilesList.innerHTML = selectedFiles.map((file, index) => {
+            const parts = file.split('\\');
+            const filename = parts[parts.length - 1];
+            return `
+                <li>
+                    <span class="selected-file-name" title="${escapeHtml(file)}">${escapeHtml(filename)}</span>
+                    <button type="button" class="btn-remove-file" data-index="${index}">&times;</button>
+                </li>
+            `;
+        }).join('');
+        
+        selectedFilesList.querySelectorAll(".btn-remove-file").forEach(btn => {
+            btn.addEventListener("click", () => {
+                const index = parseInt(btn.dataset.index);
+                selectedFiles.splice(index, 1);
+                updateSelectedFilesUI();
+            });
+        });
     }
 
 
@@ -657,7 +753,7 @@ document.addEventListener("DOMContentLoaded", () => {
         };
 
         if (!payload.submissions_dir) {
-            alert("제출물 폴더 경로를 지정해주세요.");
+            alert("분석할 제출물 파일을 1개 이상 선택해 주세요.");
             return;
         }
         
@@ -673,7 +769,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
         try {
             btnStartAnalyze.disabled = true;
-            progressPanel.style.display = "block";
             consoleLogs.innerHTML = `<div class="log-line system-line">> 분석 파이프라인 시동 중...</div>`;
             
             const res = await fetch("/api/analyze", {
@@ -683,8 +778,26 @@ document.addEventListener("DOMContentLoaded", () => {
             });
 
             if (res.ok) {
+                // 우측 상태 제어 및 로그 컴포넌트 활성화
+                switchFrameState("running");
+                progressStep.textContent = "분석 시작 준비 중...";
+                centerFrameDetail.textContent = "제출물 데이터를 불러오는 중입니다.";
+                progressBarFill.style.width = "0%";
+                progressPercent.textContent = "0%";
+
+                const pauseFrameBtnText = document.getElementById("pauseFrameBtnText");
+                const pauseFrameIcon = document.getElementById("pauseFrameIcon");
+                if (pauseFrameBtnText) pauseFrameBtnText.textContent = "일시정지";
+                if (pauseFrameIcon) {
+                    pauseFrameIcon.innerHTML = `
+                        <rect x="6" y="4" width="4" height="16"></rect>
+                        <rect x="14" y="4" width="4" height="16"></rect>
+                    `;
+                }
+
                 if (progressInterval) clearInterval(progressInterval);
-                progressInterval = setInterval(pollProgress, 1000);
+                pollProgress(); // 즉시 한 번 호출하여 2초 대기 딜레이 없이 상태 표시
+                progressInterval = setInterval(pollProgress, 2000);
             } else {
                 const data = await res.json();
                 alert(`분석 시작 실패: ${data.detail}`);
@@ -696,14 +809,83 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    // 우측 상태 제어 및 로그 컴포넌트 조건부 렌더링 상태 제어 함수 (세 개의 메인 패널은 언제나 고정 노출)
+    function switchFrameState(stateName) {
+        const frameStateIdle = document.getElementById("frameStateIdle");
+        const frameStateRunning = document.getElementById("frameStateRunning");
+        const frameStateError = document.getElementById("frameStateError");
+
+        if (!frameStateIdle || !frameStateRunning || !frameStateError) return;
+
+        // 모든 서브 컴포넌트를 먼저 숨김
+        frameStateIdle.style.display = "none";
+        frameStateRunning.style.display = "none";
+        frameStateError.style.display = "none";
+
+        if (stateName === "idle" || stateName === "completed" || stateName === "stopped") {
+            // 대기/완료 상태: 대기 화면 활성화
+            frameStateIdle.style.display = "block";
+            
+            // 왼쪽 분석 실행 버튼 활성화
+            if (btnStartAnalyze) btnStartAnalyze.disabled = false;
+        } else if (stateName === "running" || stateName === "paused") {
+            // 작업 진행 중 상태: 진행 화면 활성화
+            frameStateRunning.style.display = "block";
+            
+            // 왼쪽 분석 실행 버튼 비활성화 (동시 실행 방지)
+            if (btnStartAnalyze) btnStartAnalyze.disabled = true;
+        } else if (stateName === "error") {
+            // 에러 발생 상태: 에러 리포트 활성화
+            frameStateError.style.display = "block";
+            
+            // 왼쪽 분석 실행 버튼 비활성화
+            if (btnStartAnalyze) btnStartAnalyze.disabled = true;
+        }
+    }
+
     async function pollProgress() {
         try {
             const res = await fetch("/api/analyze/status");
             const state = await res.json();
 
-            progressStep.textContent = state.step;
-            progressPercent.textContent = `${state.progress}%`;
-            progressBarFill.style.width = `${state.progress}%`;
+            // 백엔드 상태에 따른 중앙 프레임 조건부 전환
+            switchFrameState(state.status);
+
+            if (state.status === "running" || state.status === "paused") {
+                if (state.step) {
+                    progressStep.textContent = state.step;
+                }
+                progressPercent.textContent = `${state.progress}%`;
+                progressBarFill.style.width = `${state.progress}%`;
+
+                // 최근 로그 요약을 상세 상태 영역에 표시
+                if (state.logs && state.logs.length > 0) {
+                    const cleanLog = state.logs[state.logs.length - 1]
+                        .replace(/^[❌✅🎉💾💡▶]\s*/, "")
+                        .replace(/^>\s*/, "");
+                    centerFrameDetail.textContent = cleanLog;
+                }
+            }
+
+            // 일시정지 상태에 따른 UI 제어
+            const pauseFrameBtnText = document.getElementById("pauseFrameBtnText");
+            const pauseFrameIcon = document.getElementById("pauseFrameIcon");
+            const spinningIcon = document.querySelector(".spinning-icon");
+
+            if (state.status === "paused") {
+                if (pauseFrameBtnText) pauseFrameBtnText.textContent = "재개";
+                if (pauseFrameIcon) pauseFrameIcon.innerHTML = `<polygon points="5 3 19 12 5 21 5 3"></polygon>`;
+                if (spinningIcon) spinningIcon.style.animationPlayState = "paused";
+            } else {
+                if (pauseFrameBtnText) pauseFrameBtnText.textContent = "일시정지";
+                if (pauseFrameIcon) {
+                    pauseFrameIcon.innerHTML = `
+                        <rect x="6" y="4" width="4" height="16"></rect>
+                        <rect x="14" y="4" width="4" height="16"></rect>
+                    `;
+                }
+                if (spinningIcon) spinningIcon.style.animationPlayState = "running";
+            }
 
             if (state.logs.length > 0) {
                 consoleLogs.innerHTML = state.logs.map(log => {
@@ -719,12 +901,24 @@ document.addEventListener("DOMContentLoaded", () => {
             if (state.status === "completed") {
                 clearInterval(progressInterval);
                 btnStartAnalyze.disabled = false;
+                switchFrameState("idle");
                 await fetchLastResults();
                 alert("선별 분석 작업이 완료되었습니다!");
             } else if (state.status === "error") {
                 clearInterval(progressInterval);
                 btnStartAnalyze.disabled = false;
-                alert(`분석 중 에러가 발생했습니다: ${state.error_message}`);
+                
+                // [에러 발생 상태] 전환 및 메시지 설정
+                const frameErrorMessage = document.getElementById("frameErrorMessage");
+                if (frameErrorMessage) {
+                    frameErrorMessage.textContent = state.error_message || "분석 수행 도중 심각한 에러가 발생했습니다.";
+                }
+                switchFrameState("error");
+            } else if (state.status === "stopped") {
+                clearInterval(progressInterval);
+                btnStartAnalyze.disabled = false;
+                switchFrameState("idle");
+                alert("분석 작업이 강제 종료되었습니다.");
             }
 
         } catch (err) {
@@ -805,9 +999,14 @@ document.addEventListener("DOMContentLoaded", () => {
                     <td>${hallScoreStr}</td>
                     <td><span class="badge ${badgeClass}">${r.tier}</span></td>
                     <td>
-                        <button class="btn btn-sm btn-outline btn-view-detail" data-student="${escapeHtml(r.student)}">
-                            상세보기
-                        </button>
+                        <div style="display: flex; gap: 6px;">
+                            <button class="btn btn-sm btn-outline btn-view-detail" data-student="${escapeHtml(r.student)}">
+                                상세보기
+                            </button>
+                            <button class="btn btn-sm btn-success btn-enrich-factsheet" data-title="${escapeHtml(r.book_title || '')}" data-author="${escapeHtml(r.author || r.stage2?.author || '')}">
+                                팩트시트 보강
+                            </button>
+                        </div>
                     </td>
                 </tr>
             `;
@@ -817,6 +1016,52 @@ document.addEventListener("DOMContentLoaded", () => {
             btn.addEventListener("click", () => {
                 const student = btn.dataset.student;
                 openStudentDetail(student);
+            });
+        });
+
+        document.querySelectorAll(".btn-enrich-factsheet").forEach(btn => {
+            btn.addEventListener("click", async () => {
+                const bookTitle = btn.dataset.title;
+                const author = btn.dataset.author;
+
+                if (!bookTitle) {
+                    alert("도서 정보가 존재하지 않습니다.");
+                    return;
+                }
+
+                try {
+                    btn.disabled = true;
+                    btn.textContent = "보강 중...";
+
+                    const res = await fetch("/api/analyze/enrich-factsheet", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ book_title: bookTitle, author: author })
+                    });
+
+                    if (res.ok) {
+                        const consoleLogs = document.getElementById("consoleLogs");
+                        if (consoleLogs) {
+                            const timeStr = new Date().toLocaleTimeString();
+                            const logDiv = document.createElement("div");
+                            logDiv.className = "log-line info-line";
+                            logDiv.textContent = `> [${timeStr}] 팩트시트 보강 완료 (${bookTitle} - ${author || '저자 미상'})`;
+                            consoleLogs.appendChild(logDiv);
+                            consoleLogs.scrollTop = consoleLogs.scrollHeight;
+                        }
+                        btn.textContent = "보강 완료";
+                    } else {
+                        const errData = await res.json();
+                        alert(`보강 실패: ${errData.detail || '알 수 없는 오류'}`);
+                        btn.disabled = false;
+                        btn.textContent = "팩트시트 보강";
+                    }
+                } catch (err) {
+                    console.error("보강 API 통신 에러:", err);
+                    alert("보강 중 통신 에러가 발생했습니다.");
+                    btn.disabled = false;
+                    btn.textContent = "팩트시트 보강";
+                }
             });
         });
     }
@@ -918,6 +1163,35 @@ document.addEventListener("DOMContentLoaded", () => {
         } catch (err) {
             console.error("보고서 파일 로딩 에러:", err);
             detailReportMarkdownHtml.innerHTML = `<p class="text-center" style="color: var(--text-danger); padding:20px;">마크다운 보고서를 가져올 수 없습니다.</p>`;
+        }
+    }
+
+    // Resizable Splitter Logic for live analysis logs
+    const progressPanelResizer = document.getElementById("progressPanelResizer");
+    if (progressPanelResizer) {
+        let startY, startHeight;
+        
+        progressPanelResizer.addEventListener("mousedown", (e) => {
+            startY = e.clientY;
+            startHeight = consoleLogs.clientHeight;
+            
+            document.addEventListener("mousemove", doDrag);
+            document.addEventListener("mouseup", stopDrag);
+            progressPanelResizer.classList.add("dragging");
+            e.preventDefault();
+        });
+        
+        function doDrag(e) {
+            const newHeight = startHeight + (e.clientY - startY);
+            if (newHeight >= 120 && newHeight <= 800) {
+                consoleLogs.style.height = `${newHeight}px`;
+            }
+        }
+        
+        function stopDrag() {
+            document.removeEventListener("mousemove", doDrag);
+            document.removeEventListener("mouseup", stopDrag);
+            progressPanelResizer.classList.remove("dragging");
         }
     }
 

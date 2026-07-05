@@ -192,14 +192,28 @@ def _read_xlsx_file(file_path: str) -> list[dict]:
 
 
 def read_submissions(submissions_path_or_dir: str) -> list[dict]:
-    """제출물 경로(디렉토리 또는 파일)에서 학생 제출물을 읽어 목록을 반환합니다.
+    """제출물 경로(디렉토리 또는 파일, 또는 세미콜론으로 구분된 다중 파일)에서 학생 제출물을 읽어 목록을 반환합니다.
 
     Args:
-        submissions_path_or_dir: 제출물이 저장된 디렉토리 또는 단일 파일 경로.
+        submissions_path_or_dir: 제출물이 저장된 디렉토리 또는 단일 파일 경로, 혹은 세미콜론 구분 경로.
 
     Returns:
         제출물 정보 딕셔너리 목록.
     """
+    if not submissions_path_or_dir:
+        return []
+        
+    # 세미콜론(;)으로 연결된 다중 파일 경로 처리
+    if ";" in submissions_path_or_dir:
+        results = []
+        paths = submissions_path_or_dir.split(";")
+        for p_str in paths:
+            p_str = p_str.strip()
+            if not p_str:
+                continue
+            results.extend(read_submissions(p_str))
+        return results
+
     path = Path(submissions_path_or_dir)
     if not path.exists():
         logger.error("제출물 경로가 존재하지 않습니다: %s", submissions_path_or_dir)
@@ -252,9 +266,9 @@ def read_submissions(submissions_path_or_dir: str) -> list[dict]:
             logger.error("지원하지 않는 파일 형식입니다: %s", path.name)
             return []
 
-    # 2. 디렉토리인 경우 처리 (Legacy)
+    # 2. 디렉토리인 경우 처리
     results: list[dict] = []
-    supported_extensions = {".txt", ".docx", ".pdf"}
+    supported_extensions = {".txt", ".docx", ".pdf", ".xlsx", ".xls", ".csv"}
 
     files = sorted(path.iterdir())
     for file_path in files:
@@ -264,30 +278,35 @@ def read_submissions(submissions_path_or_dir: str) -> list[dict]:
         if ext not in supported_extensions:
             continue
 
-        student, book_title = _parse_filename(file_path.name)
-
-        if ext == ".txt":
-            text = _read_txt(str(file_path))
-            file_type = "txt"
-        elif ext == ".docx":
-            text = _read_docx(str(file_path))
-            file_type = "docx"
-        elif ext == ".pdf":
-            text = _read_pdf(str(file_path))
-            file_type = "pdf"
+        if ext == ".csv":
+            results.extend(_read_csv_file(str(file_path)))
+        elif ext in (".xlsx", ".xls"):
+            results.extend(_read_xlsx_file(str(file_path)))
         else:
-            continue
+            student, book_title = _parse_filename(file_path.name)
 
-        if text is None or not text.strip():
-            continue
+            if ext == ".txt":
+                text = _read_txt(str(file_path))
+                file_type = "txt"
+            elif ext == ".docx":
+                text = _read_docx(str(file_path))
+                file_type = "docx"
+            elif ext == ".pdf":
+                text = _read_pdf(str(file_path))
+                file_type = "pdf"
+            else:
+                continue
 
-        results.append({
-            "student": student,
-            "book_title": book_title,
-            "text": text,
-            "file_path": str(file_path),
-            "file_type": file_type,
-        })
+            if text is None or not text.strip():
+                continue
+
+            results.append({
+                "student": student,
+                "book_title": book_title,
+                "text": text,
+                "file_path": str(file_path),
+                "file_type": file_type,
+            })
 
     logger.info("총 %d개 제출물 읽기 완료 (디렉토리: %s)", len(results), submissions_path_or_dir)
     return results

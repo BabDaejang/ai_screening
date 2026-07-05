@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=7">
 </head>
 <body>
     <div class="glass-bg"></div>
@@ -44,21 +44,32 @@
         <!-- 메인 제어 및 대시보드 (로그인 완료시 표시) -->
         <div class="dashboard-grid" id="mainDashboard" style="display: none;">
             
-            <!-- 왼쪽: 제어 패널, API 키 관리 및 로그 -->
+            <!-- 왼쪽: API 키 관리 및 분석 실행 (원래 위치 고정) -->
             <div class="column-left">
-                <!-- 1. 분석 실행 카드 -->
-                <section class="control-panel card">
+                <!-- 1. 분석 실행 카드 (원래 위치) -->
+                <section class="control-panel card" id="leftControlPanel">
                     <h3>🔍 분석 실행</h3>
                     <div class="form-group">
-                        <label for="submissionsDir">제출물 경로 (폴더 또는 단일 파일: Excel, CSV, PDF, TXT, DOCX)</label>
+                        <label>분석 대상 제출물 파일 선택 (Excel, CSV, PDF, TXT, DOCX)</label>
                         <div class="path-input-row">
-                            <input type="text" id="submissionsDir" placeholder="예: C:\documents\submissions" value="tests/samples/submissions">
-                            <button class="btn btn-folder-browse" id="btnBrowseFolder" title="폴더 선택">
+                            <input type="hidden" id="submissionsDir" value="">
+                            <button type="button" class="btn btn-folder-browse" id="btnBrowseFile" title="파일 선택" style="flex: 1; justify-content: center; padding: 12px; font-size: 14px;">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
-                                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                    <polyline points="14 2 14 8 20 8"/>
+                                    <line x1="16" y1="13" x2="8" y2="13"/>
+                                    <line x1="16" y1="17" x2="8" y2="17"/>
+                                    <polyline points="10 9 9 9 8 9"/>
                                 </svg>
-                                폴더 선택
+                                분석할 파일 선택하기 (복수 선택 가능)
                             </button>
+                        </div>
+                        <div class="selected-files-box" id="selectedFilesBox" style="display: none;">
+                            <div class="files-box-header">
+                                <span>선택된 파일 목록 (<strong id="selectedFilesCount">0</strong>개)</span>
+                                <button type="button" class="btn-clear-files" id="btnClearFiles">전체 해제</button>
+                            </div>
+                            <ul class="selected-files-list" id="selectedFilesList"></ul>
                         </div>
                     </div>
 
@@ -145,24 +156,96 @@
                         <!-- API 등록 상태 행들 -->
                     </div>
                 </section>
+            </div>
 
-                <!-- 3. 실시간 로딩바 및 콘솔 -->
-                <section class="progress-panel card" id="progressPanel" style="display: none;">
-                    <div class="progress-header">
-                        <span class="step-title" id="progressStep">분석 대기 중</span>
-                        <span class="step-percent" id="progressPercent">0%</span>
+            <!-- 오른쪽: 메인 프레임 (3단 수직 적층 구조) -->
+            <div class="column-right" style="display: flex; flex-direction: column; gap: 20px;">
+                <!-- ① [1단 - 최상단]: 상태/중지 제어 창 -->
+                <section class="control-panel card" id="centerFrame" style="margin-bottom: 0; padding: 20px 24px;">
+                    <!-- ①-A [대기 상태] 컴포넌트 -->
+                    <div id="frameStateIdle" class="frame-state-content" style="padding: 5px 0;">
+                        <h3 style="display: flex; align-items: center; gap: 8px; margin-top: 0; font-size: 15px; color: var(--text-secondary);">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <line x1="12" y1="8" x2="12" y2="12"></line>
+                                <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                            </svg>
+                            분석 대기 중
+                        </h3>
+                        <p style="font-size: 13px; color: var(--text-muted); margin: 10px 0 0 0; line-height: 1.5;">
+                            현재 수행 중인 분석이 없습니다. 왼쪽 [분석 실행] 영역에서 제출물 파일을 선택하고 시작해 주세요.
+                        </p>
                     </div>
-                    <div class="progress-bar-container">
-                        <div class="progress-bar-fill" id="progressBarFill" style="width: 0%;"></div>
+
+                    <!-- ①-B [작업 중 상태] 컴포넌트 -->
+                    <div id="frameStateRunning" class="frame-state-content" style="display: none; padding: 5px 0;">
+                        <h3 style="display: flex; align-items: center; gap: 8px; margin-top: 0; font-size: 15px;">
+                            <svg class="spinning-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="18" height="18" style="animation: spin 1s linear infinite;">
+                                <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+                            </svg>
+                            분석 진행 중
+                        </h3>
+                        <div class="progress-header" style="display: flex; justify-content: space-between; margin: 15px 0 8px 0; font-size: 13px; font-weight: 600;">
+                            <span id="centerFrameStep">준비 중...</span>
+                            <span id="centerFramePercent">0%</span>
+                        </div>
+                        <div class="progress-bar-container" style="width: 100%; height: 6px; background: rgba(255, 255, 255, 0.05); border-radius: 3px; overflow: hidden; margin-bottom: 15px;">
+                            <div class="progress-bar-fill" id="centerFrameBarFill" style="width: 0%; height: 100%; background: linear-gradient(90deg, var(--color-primary), #a5b4fc); border-radius: 3px; transition: width 0.3s ease-out;"></div>
+                        </div>
+                        <div class="center-status-detail" id="centerFrameDetail" style="font-family: 'Courier New', monospace; font-size: 12.5px; color: var(--text-secondary); background: rgba(0, 0, 0, 0.2); padding: 8px 14px; border-radius: 6px; width: 100%; text-align: center; box-sizing: border-box; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 15px;">
+                            제출물 데이터를 처리 중입니다...
+                        </div>
+                        <div class="center-control-actions" style="display: flex; gap: 12px; width: 100%;">
+                            <button type="button" class="btn btn-warning" id="btnPauseFrame" style="background-color: #f59e0b; color: #fff; border: none; flex: 1; padding: 10px; border-radius: 6px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 13px;">
+                                <svg id="pauseFrameIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13">
+                                    <rect x="6" y="4" width="4" height="16"></rect>
+                                    <rect x="14" y="4" width="4" height="16"></rect>
+                                </svg>
+                                <span id="pauseFrameBtnText">일시정지</span>
+                            </button>
+                            <button type="button" class="btn btn-danger" id="btnStopFrame" style="background-color: var(--color-danger); color: #fff; border: none; flex: 1; padding: 10px; border-radius: 6px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 13px;">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13">
+                                    <rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect>
+                                </svg>
+                                강제 종료
+                            </button>
+                        </div>
                     </div>
-                    <div class="console-log-box" id="consoleLogs">
+
+                    <!-- ①-C [에러 발생 상태] 컴포넌트 -->
+                    <div id="frameStateError" style="display: none; padding: 5px 0;">
+                        <h3 style="color: var(--color-danger); display: flex; align-items: center; gap: 8px; margin-top: 0; font-size: 15px;">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="18" height="18">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <line x1="12" y1="8" x2="12" y2="12"></line>
+                                <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                            </svg>
+                            분석 중 오류 발생
+                        </h3>
+                        <p style="font-size: 13px; color: var(--text-secondary); margin: 10px 0; line-height: 1.5;">
+                            선별 분석 수행 중 오류가 발생하여 스크리닝 루프가 중단되었습니다.
+                        </p>
+                        <div id="frameErrorMessage" style="font-family: 'Courier New', monospace; font-size: 12px; color: #fca5a5; background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.2); padding: 10px 14px; border-radius: 6px; max-height: 80px; overflow-y: auto; word-break: break-all; margin-bottom: 15px;">
+                            에러 상세 정보가 표시됩니다.
+                        </div>
+                        <button type="button" class="btn btn-primary btn-block" id="btnResetFrame" style="padding: 10px; font-size: 13px; border-radius: 6px;">
+                            에러 확인 및 대기로 복귀
+                        </button>
+                    </div>
+                </section>
+
+                <!-- ② [2단 - 중간]: 실시간 분석 로그 -->
+                <section class="progress-panel card" id="progressPanel" style="margin-bottom: 0; padding: 20px 24px;">
+                    <div class="progress-header" style="margin-bottom: 10px;">
+                        <span class="step-title" style="font-size: 15px; font-weight: 600; color: var(--text-primary);">📋 실시간 분석 로그</span>
+                    </div>
+                    <div class="console-log-box" id="consoleLogs" style="height: 250px; overflow-y: auto; font-size: 12.5px;">
                         <div class="log-line system-line">> 시스템이 대기 중입니다.</div>
                     </div>
                 </section>
-            </div>
+                <!-- Resizable Splitter Handle -->
+                <div class="resizer-handle" id="progressPanelResizer"></div>
 
-            <!-- 오른쪽: 분석 통계 및 결과 목록 -->
-            <div class="column-right">
                 <!-- 통계 카드 요약 -->
                 <section class="summary-widgets">
                     <div class="widget card">
@@ -411,7 +494,9 @@
         </div>
     </div>
 
+
+
     <!-- 스크립트 연결 -->
-    <script src="app.js"></script>
+    <script src="app.js?v=12"></script>
 </body>
 </html>

@@ -18,6 +18,7 @@ import argparse
 import os
 import sys
 import yaml
+from typing import Optional
 
 from utils.user_manager import UserManager
 from utils.cost_tracker import CostTracker
@@ -38,6 +39,31 @@ def load_config(config_path: str = None) -> dict:
         return yaml.safe_load(f)
 
 
+def _get_legacy_session(raw_session: Optional[dict]) -> Optional[dict]:
+    if not raw_session:
+        return None
+    api_keys = raw_session.get("api_keys", {})
+    if isinstance(api_keys, list):
+        api_keys_dict = {k: "" for k in api_keys}
+    else:
+        api_keys_dict = api_keys
+        
+    default_models = raw_session.get("default_models", {})
+    provider = default_models.get("screening_provider")
+    if not provider and api_keys_dict:
+        provider = list(api_keys_dict.keys())[0]
+        
+    api_key = api_keys_dict.get(provider, "") if provider else ""
+    
+    return {
+        "profile_name": raw_session.get("profile_name") or raw_session.get("name"),
+        "provider": provider or "",
+        "api_key": api_key,
+        "model_screening": default_models.get("screening_model") or "",
+        "model_verify": default_models.get("verify_model") or ""
+    }
+
+
 def cmd_login(um: UserManager):
     """로그인 서브커맨드."""
     profiles = um.list_profiles()
@@ -48,7 +74,9 @@ def cmd_login(um: UserManager):
     print("\n=== 프로필 로그인 ===")
     print("등록된 프로필:")
     for i, p in enumerate(profiles, 1):
-        print(f"  {i}. {p['name']} ({p['provider']})")
+        default_models = p.get("default_models", {})
+        prov = default_models.get("screening_provider") or (p["api_keys"][0] if p["api_keys"] else "없음")
+        print(f"  {i}. {p['name']} ({prov})")
 
     try:
         choice = int(input("\n프로필 번호 선택: ")) - 1
@@ -65,10 +93,11 @@ def cmd_login(um: UserManager):
     profile_name = profiles[choice]["name"]
     result = um.login(profile_name, password)
     if result:
+        legacy = _get_legacy_session(result)
         print(f"\n✅ '{profile_name}' 프로필로 로그인했습니다.")
-        print(f"   프로바이더: {result['provider']}")
-        print(f"   스크리닝 모델: {result['model_screening']}")
-        print(f"   검증 모델: {result['model_verify']}")
+        print(f"   프로바이더: {legacy['provider']}")
+        print(f"   스크리닝 모델: {legacy['model_screening']}")
+        print(f"   검증 모델: {legacy['model_verify']}")
         return True
     else:
         print("\n❌ 암호가 올바르지 않습니다.")
@@ -137,7 +166,7 @@ def ensure_login(um: UserManager, config: dict) -> dict:
     current = um.get_current_profile()
     if current:
         # 이미 로그인됨 — 세션 데이터 반환
-        return um.get_session_data()
+        return _get_legacy_session(um.get_session_data())
 
     profiles = um.list_profiles()
     if not profiles:
@@ -148,7 +177,7 @@ def ensure_login(um: UserManager, config: dict) -> dict:
             return None
 
     if cmd_login(um):
-        return um.get_session_data()
+        return _get_legacy_session(um.get_session_data())
     return None
 
 
@@ -351,11 +380,32 @@ def run_pipeline(args, config: dict, session: dict):
 
 
 def main():
+    # 1. sys.argv 전처리: 서브커맨드가 없으면 'run' 커맨드를 강제로 주입
+    commands = {'login', 'logout', 'add-profile', 'list-profiles', 'delete-profile', 'select-model', 'run'}
+    has_command = False
+    for arg in sys.argv[1:]:
+        if arg in commands:
+            has_command = True
+            break
+        if arg in ('-h', '--help'):
+            has_command = True
+            break
+            
+    if not has_command:
+        # 첫 번째 실질적인 인자(플래그 제외)의 앞에 'run' 커맨드를 삽입
+        idx = 1
+        while idx < len(sys.argv) and sys.argv[idx].startswith('-'):
+            idx += 1
+        sys.argv.insert(idx, 'run')
+
     parser = argparse.ArgumentParser(
         description="독서 수행평가 AI 사용 의심 선별·검증 도구",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="점수는 증거가 아니며 최종 판단은 교사의 구술 면담으로 확인합니다.",
     )
+
+    # 글로벌 옵션 등록
+    parser.add_argument("--config", default=None, help="config.yaml 경로 지정")
 
     subparsers = parser.add_subparsers(dest="command", help="서브커맨드")
 
@@ -370,12 +420,12 @@ def main():
 
     subparsers.add_parser("select-model", help="현재 프로필의 모델 변경")
 
-    # 메인 실행 (서브커맨드 없이 제출물 폴더 지정)
-    parser.add_argument("submissions_dir", nargs="?", help="제출물 폴더 경로")
-    parser.add_argument("--verify-all", action="store_true", help="전원 3단계 실행")
-    parser.add_argument("--no-verify", action="store_true", help="3단계 생략")
-    parser.add_argument("--no-web", action="store_true", help="팩트시트 자동 생성 금지")
-    parser.add_argument("--config", default=None, help="config.yaml 경로 지정")
+    # run 서브커맨드 정의 (기본 실행 모드)
+    run_parser = subparsers.add_parser("run", help="분석 실행")
+    run_parser.add_argument("submissions_dir", nargs="?", help="제출물 폴더/파일 경로")
+    run_parser.add_argument("--verify-all", action="store_true", help="전원 3단계 실행")
+    run_parser.add_argument("--no-verify", action="store_true", help="3단계 생략")
+    run_parser.add_argument("--no-web", action="store_true", help="팩트시트 자동 생성 금지")
 
     args = parser.parse_args()
 
@@ -403,14 +453,14 @@ def main():
         cmd_select_model(um, config)
         return
 
-    # 메인 실행: 제출물 폴더 필수
+    # 메인 실행: 제출물 폴더 또는 파일 경로 필수
     if not args.submissions_dir:
-        parser.print_help()
-        print("\n❌ 제출물 폴더 경로를 지정하세요.")
+        run_parser.print_help()
+        print("\n❌ 제출물 폴더 또는 파일 경로를 지정하세요.")
         sys.exit(1)
 
-    if not os.path.isdir(args.submissions_dir):
-        print(f"❌ 폴더를 찾을 수 없습니다: {args.submissions_dir}")
+    if not os.path.exists(args.submissions_dir):
+        print(f"❌ 경로를 찾을 수 없습니다: {args.submissions_dir}")
         sys.exit(1)
 
     # 로그인 확인
@@ -419,7 +469,7 @@ def main():
         print("❌ 로그인에 실패했습니다. 프로그램을 종료합니다.")
         sys.exit(1)
 
-    print(f"\n👤 {session.get('profile_name', '알 수 없음')} | {session['provider']} | {session['model_screening']} / {session['model_verify']}")
+    print(f"\n[Profile] {session.get('profile_name', '알 수 없음')} | {session['provider']} | {session['model_screening']} / {session['model_verify']}")
 
     # 파이프라인 실행
     try:

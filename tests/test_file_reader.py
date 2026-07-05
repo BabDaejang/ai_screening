@@ -79,3 +79,28 @@ def test_read_submissions_txt(tmp_path):
     assert results[0]["book_title"] == "1984"
     assert "독후감" in results[0]["text"]
     assert results[0]["file_type"] == "txt"
+
+
+def test_read_submissions_dir(tmp_path):
+    # 텍스트 파일 생성
+    txt_file = tmp_path / "김철수_1984.txt"
+    with open(txt_file, "w", encoding="utf-8") as f:
+        f.write("이것은 김철수가 쓴 1984 독후감입니다.")
+        
+    # CSV 파일 생성
+    csv_file = tmp_path / "submissions.csv"
+    with open(csv_file, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerows([
+            ["학생명", "도서명", "독후감 내용"],
+            ["이영희", "동물농장", "동물들이 반란을 일으키는 소설이다."]
+        ])
+        
+    results = read_submissions(str(tmp_path))
+    
+    # TXT에서 1개, CSV에서 1개 총 2개 로드되어야 함
+    assert len(results) == 2
+    
+    students = {r["student"] for r in results}
+    assert "김철수" in students
+    assert "이영희" in students

@@ -49,13 +49,17 @@ class LLMProvider(ABC):
         pass
 
     @abstractmethod
-    def generate_factsheet(self, book_title: str) -> str:
+    def generate_factsheet(self, book_title: str, prompt_override: Optional[str] = None) -> str:
         """3-1단계: 책 제목에 대한 사실 정보(팩트시트) 생성.
 
         Returns:
             마크다운 포맷의 팩트시트 내용
         """
         pass
+
+    def generate_enriched_factsheet(self, book_title: str, prompt_override: Optional[str] = None) -> str:
+        """3-1단계 심층보강: 책 제목에 대한 풍부한 사실 정보(팩트시트) 생성."""
+        return self.generate_factsheet(book_title, prompt_override=prompt_override)
 
     @abstractmethod
     def verify_claims(self, system_prompt: str, claims: list, full_text: str, max_tokens: int = 2000) -> dict:
