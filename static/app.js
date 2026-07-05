@@ -80,6 +80,8 @@ document.addEventListener("DOMContentLoaded", () => {
     // Results Panel
     const filterTier = document.getElementById("filterTier");
     const btnExportCSV = document.getElementById("btnExportCSV");
+    const btnImportCSV = document.getElementById("btnImportCSV");
+    const inputImportCSV = document.getElementById("inputImportCSV");
     const resultsTableBody = document.querySelector("#resultsTable tbody");
 
     // Modal Student Detail
@@ -235,6 +237,43 @@ document.addEventListener("DOMContentLoaded", () => {
     btnExportCSV.addEventListener("click", () => {
         window.location.href = "/api/export";
     });
+
+    // Import CSV (기존 작업 복구 — 체크포인트 백필 + Delta 재처리 대상 식별)
+    if (btnImportCSV && inputImportCSV) {
+        btnImportCSV.addEventListener("click", () => {
+            inputImportCSV.value = "";
+            inputImportCSV.click();
+        });
+
+        inputImportCSV.addEventListener("change", async () => {
+            const file = inputImportCSV.files[0];
+            if (!file) return;
+
+            const formData = new FormData();
+            formData.append("file", file);
+
+            try {
+                btnImportCSV.disabled = true;
+                const res = await fetch("/api/import", {
+                    method: "POST",
+                    body: formData,
+                });
+                const data = await res.json();
+
+                if (res.ok) {
+                    alert(`${data.message}\n\n(재처리가 필요한 ${data.incomplete}명은 동일한 제출물 폴더로 분석을 다시 시작하면 자동으로 이어서 처리됩니다.)`);
+                    await fetchLastResults();
+                } else {
+                    alert(`CSV 업로드 복구 실패: ${data.detail || "알 수 없는 오류"}`);
+                }
+            } catch (err) {
+                console.error("CSV 업로드 에러:", err);
+                alert("CSV 업로드 중 통신 에러가 발생했습니다.");
+            } finally {
+                btnImportCSV.disabled = false;
+            }
+        });
+    }
 
     // Detail Modal Close
     btnCloseDetailModal.addEventListener("click", () => modalStudentDetail.style.display = "none");

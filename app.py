@@ -2,6 +2,8 @@ from dotenv import load_dotenv
 load_dotenv() # .env 로드
 
 import asyncio
+import csv
+import io
 import json
 import logging
 import os
@@ -12,7 +14,7 @@ import webbrowser
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -181,11 +183,13 @@ def load_book_cache() -> dict:
         return {}
 
 def save_book_cache(cache_data: dict):
-    """book_cache.json 마스터 파일에 캐시 딕셔너리를 안전하게 저장합니다."""
+    """book_cache.json 마스터 파일에 캐시 딕셔너리를 안전하게 저장합니다 (Write-Through: flush+fsync)."""
     cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "book_cache.json")
     try:
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(cache_data, f, ensure_ascii=False, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
     except OSError as e:
         logger.error(f"book_cache.json 저장 실패: {e}")
 
@@ -260,6 +264,56 @@ def lookup_author(book_title: str, provider) -> str:
     except Exception as e:
         logger.error(f"저자 역추적 중 에러: {e}")
     return "Unknown"
+
+def ensure_book_factsheet_cached(
+    book_title: str,
+    author: str,
+    provider_verify,
+    book_cache: dict,
+    factsheets_dir: str,
+    no_web: bool,
+) -> str:
+    """도서 1권의 팩트시트를 확보한다 (CASE A: 캐시 재사용 / CASE B: 신규 생성 후 Write-Through).
+
+    book_cache.json 및 factsheets/*.md 로컬 파일에 즉시 flush+fsync 기록하며,
+    Phase 2 진입 시의 배치 선제 생성과 Phase 3의 개별 검증 단계에서 공통으로 재사용된다.
+    """
+    cache_key = normalize_cache_key(book_title, author)
+
+    if cache_key in book_cache:
+        add_log(f"💾 캐시 히트! '{cache_key}' 도서 정보를 book_cache.json에서 불러옵니다. (토큰 0)")
+        factsheet_content = book_cache[cache_key].get("factsheet", "")
+    else:
+        if no_web:
+            add_log(f"🌐 캐시 미스했으나 no_web 옵션 활성화 상태로 생략: {cache_key}")
+            return ""
+
+        add_log(f"🌐 캐시 미스! '{cache_key}' 도서의 팩트시트를 생성합니다. (웹 검색/LLM 가동)")
+        factsheet_content = provider_verify.generate_factsheet(book_title)
+
+        book_cache[cache_key] = {
+            "book_title": book_title,
+            "author": author,
+            "factsheet": factsheet_content,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        save_book_cache(book_cache)
+        add_log(f"💾 '{cache_key}' 도서 정보를 book_cache.json에 저장 완료.")
+
+    if factsheet_content:
+        normalized_title = _normalize_title(book_title)
+        if normalized_title:
+            os.makedirs(factsheets_dir, exist_ok=True)
+            filepath = os.path.join(factsheets_dir, f"{normalized_title}.md")
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(factsheet_content)
+                f.flush()
+                os.fsync(f.fileno())
+            success_msg = f"[SUCCESS: Saved Fact Sheet for {book_title} to local file]"
+            print(success_msg)
+            add_log(success_msg)
+
+    return factsheet_content
 
 # -------------------------------------------------------------
 # 모델 캐시 로드, 저장 및 백그라운드 갱신 헬퍼 함수
@@ -800,6 +854,41 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
             # 사용자가 [다음 단계 진행]을 클릭하기 전까지는 토큰을 소비하는 2단계로 절대 진입하지 않는다.
             wait_for_phase_gate("phase2")
 
+            # book_cache / factsheets_dir / book_author_map은 아래 배치 선제 생성과
+            # 3단계의 개별 팩트시트 확보 로직이 공유하는 상태이므로 여기서 한 번만 초기화한다.
+            factsheets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "factsheets")
+            os.makedirs(factsheets_dir, exist_ok=True)
+            book_cache = load_book_cache()
+            book_author_map: dict[str, str] = {}
+
+            # -----------------------------------------------------------------
+            # 2단계 진입 즉시: analysis_state["results"]에 이미 확보된 고유 도서명을
+            # 추출하여 팩트시트를 최우선 배치 생성한다 (학생별 스크리닝 루프 진입 전).
+            # book_cache.json / factsheets/*.md에 즉시 flush+fsync로 write-through된다.
+            # -----------------------------------------------------------------
+            if not req.no_verify:
+                unique_titles = sorted({r["book_title"] for r in new_results if r.get("book_title")})
+                if unique_titles:
+                    add_log(f"📚 2단계 진입과 동시에 고유 도서 {len(unique_titles)}종의 팩트시트를 선제 생성합니다.")
+                    provider_verify_prefetch = create_provider(
+                        provider_name=req.verify_provider,
+                        api_key=verify_key,
+                        model_screening="",  # 사용되지 않음
+                        model_verify=req.verify_model,
+                        cost_tracker=cost_tracker
+                    )
+                    for book_title in unique_titles:
+                        try:
+                            author = lookup_author(book_title, provider_verify_prefetch)
+                            book_author_map[book_title] = author
+                            ensure_book_factsheet_cached(
+                                book_title, author, provider_verify_prefetch,
+                                book_cache, factsheets_dir, req.no_web,
+                            )
+                        except Exception as ex:
+                            logger.error(f"[선제생성] 도서 '{book_title}' 팩트시트 준비 중 에러(계속 진행): {ex}")
+                            continue
+
             # 2단계 AI 스크리닝 (신규 대상만)
             update_progress(45, "2단계: AI 문체 스크리닝 중...")
             add_log(f"[2단계] LLM 스크리닝 시작 (모델: {req.screening_provider}/{req.screening_model})")
@@ -883,12 +972,7 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                     cost_tracker=cost_tracker
                 )
 
-                factsheets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "factsheets")
-                os.makedirs(factsheets_dir, exist_ok=True)
-
-                # book_cache.json (Fact Sheet 레지스트리) 로드
-                book_cache = load_book_cache()
-
+                # book_cache / factsheets_dir는 2단계 진입 시 이미 초기화·선제생성되어 공유되므로 재사용한다.
                 for cand in candidates:
                     book_title = None
                     try:
@@ -897,55 +981,30 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                         if not book_title or book_title.lower() == "unknown":
                             continue
 
-                        # 2. 저자명 자동 추적 및 메타데이터 보완 (Author Auto-Correction)
-                        author = cand.get("stage2", {}).get("author") or cand.get("author")
+                        # 2. 저자명 확보: 2단계 선제생성 시 이미 조회된 값을 최우선 재사용하여
+                        #    캐시 키(cache_key)가 어긋나지 않도록 하고, 중복 저자 역추적을 방지한다.
+                        author = (
+                            book_author_map.get(book_title)
+                            or cand.get("stage2", {}).get("author")
+                            or cand.get("author")
+                        )
                         if not author or author.strip() == "":
                             add_log(f"🔍 '{book_title}' 도서의 저자 정보 누락 감지. 저자 역추적 중...")
                             author = lookup_author(book_title, provider_verify)
                             add_log(f"✅ 저자 추적 완료: '{book_title}' -> '{author}'")
+                            book_author_map[book_title] = author
 
-                            # 데이터 구조에 강제 업데이트하여 데이터 유실 방지
-                            if "stage2" not in cand:
-                                cand["stage2"] = {}
-                            cand["stage2"]["author"] = author
-                            cand["author"] = author
+                        # 데이터 구조에 강제 업데이트하여 데이터 유실 방지
+                        if "stage2" not in cand:
+                            cand["stage2"] = {}
+                        cand["stage2"]["author"] = author
+                        cand["author"] = author
 
-                        # 3. 고유 키(Key) 생성
-                        cache_key = normalize_cache_key(book_title, author)
-
-                        # 4. Fact Sheet Cache-Look-up (CASE A/B 분기)
-                        if cache_key in book_cache:
-                            # CASE A (로컬에 존재): 재생성 생략, 캐시된 팩트시트 재사용
-                            add_log(f"💾 캐시 히트! '{cache_key}' 도서 정보를 book_cache.json에서 불러옵니다. (토큰 0)")
-                            factsheet_content = book_cache[cache_key].get("factsheet", "")
-                        else:
-                            # CASE B (로컬에 부재): 팩트시트 생성 태스크 즉시 트리거
-                            if req.no_web:
-                                add_log(f"🌐 캐시 미스했으나 no_web 옵션 활성화 상태로 생략: {cache_key}")
-                                factsheet_content = ""
-                            else:
-                                add_log(f"🌐 캐시 미스! '{cache_key}' 도서의 팩트시트를 생성합니다. (웹 검색/LLM 가동)")
-                                factsheet_content = provider_verify.generate_factsheet(book_title)
-
-                                # Checkpoint Saving: 전역 캐시 딕셔너리에 즉시 병합 저장 (Write-Through)
-                                book_cache[cache_key] = {
-                                    "book_title": book_title,
-                                    "author": author,
-                                    "factsheet": factsheet_content,
-                                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
-                                }
-                                save_book_cache(book_cache)
-                                success_msg = f"[SUCCESS: Saved Fact Sheet for {book_title} to local file]"
-                                print(success_msg)
-                                add_log(success_msg)
-
-                        # 5. 로컬 팩트시트 파일 생성 (stages.stage3_verify와의 연동용)
-                        if factsheet_content:
-                            normalized_title = _normalize_title(book_title)
-                            if normalized_title:
-                                filepath = os.path.join(factsheets_dir, f"{normalized_title}.md")
-                                with open(filepath, "w", encoding="utf-8") as f:
-                                    f.write(factsheet_content)
+                        # 3~5. Fact Sheet Cache-Look-up(CASE A/B) 및 로컬 파일 Write-Through
+                        ensure_book_factsheet_cached(
+                            book_title, author, provider_verify,
+                            book_cache, factsheets_dir, req.no_web,
+                        )
                     except Exception as ex:
                         # Defensive: 특정 항목 대조 중 에러가 나더라도 continue로 강제 진행
                         logger.error(f"도서 '{book_title}' 사실검증 캐싱 준비 에러 (루프 계속 진행): {ex}")
@@ -1227,10 +1286,163 @@ def get_results():
 # -------------------------------------------------------------
 @app.get("/api/export")
 def export_csv():
-    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "screening_summary.csv")
-    if not os.path.exists(csv_path):
-        raise HTTPException(status_code=404, detail="CSV 결과 파일이 존재하지 않습니다. 먼저 분석을 돌려주세요.")
+    """analysis_state["results"]의 현재 인메모리 스냅샷을 즉시 CSV로 동적 직렬화하여 반환한다.
+
+    파이프라인이 idle/running/paused/awaiting_phase/completed 등 어떤 상태에 있든
+    (진행 중이라도) 그 시점까지 누적된 결과를 그대로 최신 CSV로 재생성해 다운로드할 수 있다.
+    """
+    with state_lock:
+        results_snapshot = list(analysis_state["results"])
+
+    if not results_snapshot:
+        raise HTTPException(status_code=404, detail="아직 생성된 분석 결과가 없습니다. 먼저 분석을 시작해 주세요.")
+
+    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, "screening_summary.csv")
+
+    try:
+        generate_csv(results_snapshot, csv_path)
+    except Exception as e:
+        logger.error(f"CSV 동적 직렬화 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"CSV 생성 실패: {e}")
+
     return FileResponse(csv_path, media_type="text/csv", filename="screening_summary.csv")
+
+def _csv_val_to_float(val) -> Optional[float]:
+    """CSV 셀 값을 float로 변환한다. 비어있거나 변환 불가하면 None (결측 판정용)."""
+    if val is None:
+        return None
+    val_s = str(val).strip()
+    if not val_s:
+        return None
+    try:
+        return float(val_s)
+    except (ValueError, TypeError):
+        return None
+
+@app.post("/api/import")
+async def import_csv(file: UploadFile = File(...)):
+    """이전에 다운로드한 screening_summary.csv를 업로드하여 analysis_state["results"]를 복구한다.
+
+    - 완전히 처리된(rule_score/ai_score 존재, 검증이 필요한 등급이면 hallucination_score도 존재) 행은
+      screening_results.jsonl 체크포인트에 백필하여, 다음 분석 실행 시 기존 재개(Resume) 엔진이
+      해당 학생을 자동으로 스킵(토큰 소모 0)하도록 만든다.
+    - 점수가 누락/비어있는(Delta) 행은 체크포인트에 올리지 않아 다음 실행 시 자동으로 재처리된다.
+    """
+    with state_lock:
+        if analysis_state["status"] in ("running", "paused", "awaiting_phase"):
+            raise HTTPException(status_code=400, detail="분석이 진행 중일 때는 결과를 복구할 수 없습니다. 먼저 정지해 주세요.")
+
+    try:
+        raw_bytes = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"파일 읽기 실패: {e}")
+
+    # generate_csv()가 utf-8-sig(BOM)로 저장하므로 동일 인코딩으로 복원, 실패 시 cp949 재시도
+    text = None
+    for encoding in ("utf-8-sig", "cp949", "utf-8"):
+        try:
+            text = raw_bytes.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise HTTPException(status_code=400, detail="CSV 파일 인코딩을 해석할 수 없습니다 (UTF-8/CP949 지원).")
+
+    try:
+        reader = csv.DictReader(io.StringIO(text))
+        rows = list(reader)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"CSV 파싱 실패: {e}")
+
+    if not rows:
+        raise HTTPException(status_code=400, detail="CSV 파일에 데이터 행이 없습니다.")
+
+    completed_map = load_completed_results()
+    imported: list = []
+    backfilled = 0
+    incomplete = 0
+
+    for row in rows:
+        try:
+            student = (row.get("student") or "").strip()
+            if not student:
+                continue
+
+            rule_score = _csv_val_to_float(row.get("rule_score"))
+            ai_score = _csv_val_to_float(row.get("ai_score"))
+            hallucination_score = _csv_val_to_float(row.get("hallucination_score"))
+            tier = (row.get("tier") or "").strip() or None
+
+            ai_signals_raw = row.get("ai_signals") or ""
+            ai_signals = [s.strip() for s in ai_signals_raw.split(";") if s.strip()]
+
+            try:
+                contradictions = int(float(row.get("contradictions"))) if (row.get("contradictions") or "").strip() else 0
+            except (ValueError, TypeError):
+                contradictions = 0
+
+            book_title = (row.get("book_title") or "").strip()
+
+            record = {
+                "student": student,
+                "student_id": (row.get("student_id") or "").strip(),
+                "student_name": (row.get("student_name") or "").strip() or student,
+                "book_title": book_title,
+                "rule_score": rule_score if rule_score is not None else 0,
+                "rule_evidence": row.get("rule_evidence") or "",
+                "rule_details": {},
+                "edit_time_min": row.get("edit_time_min") or "",
+                "ai_score": ai_score if ai_score is not None else 0,
+                "ai_signals": ai_signals,
+                "stage2": {"book_title": book_title or None, "signals": ai_signals, "rationale": ""},
+                "contradictions": contradictions,
+                "hallucination_score": hallucination_score if hallucination_score is not None else 0,
+                "tier": tier or "하",
+                "stage3": ({"hallucination_score": hallucination_score, "claims": []} if hallucination_score is not None else {}),
+                "report": row.get("report") or "",
+                "text": "",
+                "file_type": "imported_csv",
+                "file_path": "",
+                "metadata": None,
+            }
+
+            # Delta Detection: 규칙/스크리닝 점수가 없으면 미완료. 상위 등급인데 검증 결과가
+            # 없으면(hallucination_score 결측) 검증이 누락된 것으로 간주해 미완료 처리한다.
+            is_complete = rule_score is not None and ai_score is not None
+            if is_complete and tier in ("상", "최우선") and hallucination_score is None:
+                is_complete = False
+
+            if is_complete and student not in completed_map:
+                append_screening_result(record)
+                completed_map[student] = record
+                backfilled += 1
+            elif not is_complete:
+                incomplete += 1
+
+            imported.append(record)
+        except (KeyError, ValueError, TypeError) as e:
+            logger.warning(f"CSV 행 파싱 실패 (해당 행 스킵, 나머지는 계속 진행): {e}")
+            continue
+
+    if not imported:
+        raise HTTPException(status_code=400, detail="유효한 학생 데이터를 CSV에서 찾지 못했습니다.")
+
+    with state_lock:
+        analysis_state["results"] = imported
+        analysis_state["status"] = "idle"
+        analysis_state["error_message"] = ""
+
+    msg = f"CSV 업로드 복구 완료: 총 {len(imported)}명 로드, 체크포인트 백필 {backfilled}명, 재처리 필요(Delta) {incomplete}명"
+    add_log(f"📥 {msg}")
+
+    return {
+        "message": msg,
+        "total": len(imported),
+        "backfilled": backfilled,
+        "incomplete": incomplete,
+    }
 
 def markdown_to_html(md: str) -> str:
     lines = md.split("\n")

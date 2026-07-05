@@ -328,6 +328,13 @@
                                 </svg>
                                 CSV 다운로드
                             </button>
+                            <input type="file" id="inputImportCSV" accept=".csv" style="display: none;">
+                            <button class="btn btn-sm btn-outline" id="btnImportCSV" title="이전에 다운로드한 screening_summary.csv를 업로드하여 작업을 이어갑니다">
+                                <svg class="download-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transform: rotate(180deg);">
+                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+                                </svg>
+                                CSV 업로드
+                            </button>
                         </div>
                     </div>
 
@@ -547,6 +554,6 @@
     </div>
 
     <!-- 스크립트 연결 -->
-    <script src="app.js?v=13"></script>
+    <script src="app.js?v=14"></script>
 </body>
 </html>
