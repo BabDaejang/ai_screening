@@ -490,6 +490,17 @@ body {
     border-radius: 8px;
     background-color: rgba(0, 0, 0, 0.15);
 }
+
+/* Task 2: 로컬 도서 인벤토리 패널 (펼치기/접기 토글) */
+.book-inventory-container {
+    max-height: 600px;
+    overflow-y: auto;
+    transition: max-height 0.25s ease;
+}
+.book-inventory-container.collapsed {
+    max-height: 210px;
+    overflow-y: hidden;
+}
 .data-table {
     width: 100%;
     border-collapse: collapse;

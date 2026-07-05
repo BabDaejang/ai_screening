@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 _CSV_COLUMNS = [
     "student",
+    "student_id",
+    "student_name",
     "book_title",
     "rule_score",
     "rule_evidence",
@@ -104,7 +106,9 @@ def generate_report(student_data: dict, output_dir: str) -> Optional[str]:
     stage2 = student_data.get("stage2", {})
     stage3 = student_data.get("stage3", {})
 
-    book_title = stage2.get("book_title") or student_data.get("book_title", "미상")
+    book_title = student_data.get("book_title") or stage2.get("book_title") or "미상"
+    student_id = student_data.get("student_id", "")
+    student_name = student_data.get("student_name") or student
     tier = student_data.get("tier", "-")
     rule_score = student_data.get("rule_score", "-")
     ai_score = student_data.get("ai_score", "-")
@@ -128,6 +132,8 @@ def generate_report(student_data: dict, output_dir: str) -> Optional[str]:
     lines = [
         f"# 📝 AI 사용 의심 선별 보고서 — {student}",
         "",
+        f"- **학번**: {student_id or '-'}",
+        f"- **이름**: {student_name}",
         f"- **도서명**: {book_title or '미상'}",
         f"- **등급**: {tier}",
         f"- **규칙 점수**: {rule_score}",

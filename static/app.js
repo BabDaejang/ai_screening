@@ -88,9 +88,27 @@ document.addEventListener("DOMContentLoaded", () => {
     const tabButtons = document.querySelectorAll(".tab-btn");
     const tabContents = document.querySelectorAll(".tab-content");
 
+    // Task 2: 로컬 도서 인벤토리 패널
+    const btnToggleBookInventory = document.getElementById("btnToggleBookInventory");
+    const bookInventoryContainer = document.getElementById("bookInventoryContainer");
+    const bookInventoryTableBody = document.getElementById("bookInventoryTableBody");
+    let bookInventoryExpanded = false;
+
+    // Modal Factsheet Viewer
+    const modalFactsheetView = document.getElementById("modalFactsheetView");
+    const btnCloseFactsheetModal = document.getElementById("btnCloseFactsheetModal");
+    const factsheetViewTitle = document.getElementById("factsheetViewTitle");
+    const factsheetViewPath = document.getElementById("factsheetViewPath");
+    const factsheetViewHtml = document.getElementById("factsheetViewHtml");
+
+    // Task 5: 단계별 게이팅 버튼
+    const btnNextPhase = document.getElementById("btnNextPhase");
+    const btnNextPhaseText = document.getElementById("btnNextPhaseText");
+
     // Initial Load
     fetchConfig();
     checkLoginStatus();
+    fetchBookInventory();
 
     // -------------------------------------------------------------
     // Event Listeners
@@ -828,10 +846,10 @@ document.addEventListener("DOMContentLoaded", () => {
             
             // 왼쪽 분석 실행 버튼 활성화
             if (btnStartAnalyze) btnStartAnalyze.disabled = false;
-        } else if (stateName === "running" || stateName === "paused") {
-            // 작업 진행 중 상태: 진행 화면 활성화
+        } else if (stateName === "running" || stateName === "paused" || stateName === "awaiting_phase") {
+            // 작업 진행 중 상태(단계 게이트 대기 포함): 진행 화면 활성화
             frameStateRunning.style.display = "block";
-            
+
             // 왼쪽 분석 실행 버튼 비활성화 (동시 실행 방지)
             if (btnStartAnalyze) btnStartAnalyze.disabled = true;
         } else if (stateName === "error") {
@@ -851,7 +869,7 @@ document.addEventListener("DOMContentLoaded", () => {
             // 백엔드 상태에 따른 중앙 프레임 조건부 전환
             switchFrameState(state.status);
 
-            if (state.status === "running" || state.status === "paused") {
+            if (state.status === "running" || state.status === "paused" || state.status === "awaiting_phase") {
                 if (state.step) {
                     progressStep.textContent = state.step;
                 }
@@ -868,6 +886,22 @@ document.addEventListener("DOMContentLoaded", () => {
 
                 // [선별 결과 목록] 실시간 반영: 완료된 학생이 생길 때마다 즉시 테이블에 노출
                 await refreshLiveResults();
+                // Task 2: 새로 생성된 팩트시트가 있을 수 있으므로 도서 인벤토리도 함께 갱신
+                await fetchBookInventory();
+            }
+
+            // Task 5: 단계 게이트 대기 상태에서만 [다음 단계 진행] 버튼 활성화
+            if (btnNextPhase) {
+                btnNextPhase.disabled = state.status !== "awaiting_phase";
+                if (btnNextPhaseText) {
+                    if (state.status === "awaiting_phase" && state.awaiting_phase === "phase2") {
+                        btnNextPhaseText.textContent = "2단계(AI 스크리닝) 진행";
+                    } else if (state.status === "awaiting_phase" && state.awaiting_phase === "phase3") {
+                        btnNextPhaseText.textContent = "3단계(사실 검증) 진행";
+                    } else {
+                        btnNextPhaseText.textContent = "다음 단계 진행";
+                    }
+                }
             }
 
             // 일시정지 상태에 따른 UI 제어
@@ -906,6 +940,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 btnStartAnalyze.disabled = false;
                 switchFrameState("idle");
                 await fetchLastResults();
+                await fetchBookInventory();
                 alert("선별 분석 작업이 완료되었습니다!");
             } else if (state.status === "error") {
                 clearInterval(progressInterval);
@@ -964,6 +999,111 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    // -------------------------------------------------------------
+    // Task 2: 로컬 도서 인벤토리 (book_cache.json) 패널
+    // -------------------------------------------------------------
+    async function fetchBookInventory() {
+        try {
+            const res = await fetch("/api/book-inventory");
+            if (!res.ok) return;
+            const data = await res.json();
+            renderBookInventory(data.books || []);
+        } catch (err) {
+            console.error("도서 인벤토리 조회 에러:", err);
+        }
+    }
+
+    function renderBookInventory(books) {
+        if (!bookInventoryTableBody) return;
+
+        if (books.length === 0) {
+            bookInventoryTableBody.innerHTML = `
+                <tr class="empty-row">
+                    <td colspan="4">아직 저장된 도서 팩트시트가 없습니다.</td>
+                </tr>
+            `;
+            return;
+        }
+
+        // 접힌 상태(미리보기)에서는 상위 5개만, 펼친 상태에서는 전체를 스크롤 뷰로 렌더
+        const previewCount = 5;
+        const visibleBooks = bookInventoryExpanded ? books : books.slice(0, previewCount);
+
+        bookInventoryTableBody.innerHTML = visibleBooks.map(b => `
+            <tr>
+                <td style="font-weight: 600;">${escapeHtml(b.book_title || "미상")}</td>
+                <td>${escapeHtml(b.author || "-")}</td>
+                <td style="font-size: 11.5px; color: var(--text-muted);">${escapeHtml(b.updated_at || "-")}</td>
+                <td>
+                    <button class="btn btn-sm btn-outline btn-view-factsheet" data-cache-key="${escapeHtml(b.cache_key)}" data-title="${escapeHtml(b.book_title || "")}">
+                        팩트시트 확인
+                    </button>
+                </td>
+            </tr>
+        `).join("");
+
+        document.querySelectorAll(".btn-view-factsheet").forEach(btn => {
+            btn.addEventListener("click", () => {
+                openFactsheetView(btn.dataset.cacheKey, btn.dataset.title);
+            });
+        });
+    }
+
+    if (btnToggleBookInventory) {
+        btnToggleBookInventory.addEventListener("click", () => {
+            bookInventoryExpanded = !bookInventoryExpanded;
+            bookInventoryContainer.classList.toggle("collapsed", !bookInventoryExpanded);
+            btnToggleBookInventory.textContent = bookInventoryExpanded ? "접기" : "펼치기";
+            fetchBookInventory();
+        });
+    }
+
+    // 도서의 정확한 팩트시트 파일(로컬 .md)을 즉시 열람 (Task 2: 팩트시트 링커)
+    async function openFactsheetView(cacheKey, bookTitle) {
+        factsheetViewTitle.textContent = bookTitle || "도서명";
+        factsheetViewPath.textContent = "";
+        factsheetViewHtml.innerHTML = `<p class="text-center" style="color: var(--text-muted); padding:20px;">팩트시트 파일을 불러오는 중...</p>`;
+        modalFactsheetView.style.display = "flex";
+
+        try {
+            const res = await fetch(`/api/book-inventory/${encodeURIComponent(cacheKey)}/factsheet`);
+            if (res.ok) {
+                const data = await res.json();
+                factsheetViewTitle.textContent = data.book_title || bookTitle || "도서명";
+                factsheetViewPath.textContent = data.file_path ? `📂 ${data.file_path}` : "";
+                factsheetViewHtml.innerHTML = data.html || "<p>내용이 없습니다.</p>";
+            } else {
+                const errData = await res.json();
+                factsheetViewHtml.innerHTML = `<p class="text-center" style="color: var(--text-danger); padding:20px;">${escapeHtml(errData.detail || "팩트시트를 찾을 수 없습니다.")}</p>`;
+            }
+        } catch (err) {
+            console.error("팩트시트 열람 에러:", err);
+            factsheetViewHtml.innerHTML = `<p class="text-center" style="color: var(--text-danger); padding:20px;">팩트시트 조회 중 통신 에러가 발생했습니다.</p>`;
+        }
+    }
+
+    if (btnCloseFactsheetModal) {
+        btnCloseFactsheetModal.addEventListener("click", () => {
+            modalFactsheetView.style.display = "none";
+        });
+    }
+
+    // Task 5: [다음 단계 진행] 버튼 — 단계 경계 게이트를 해제한다
+    if (btnNextPhase) {
+        btnNextPhase.addEventListener("click", async () => {
+            try {
+                btnNextPhase.disabled = true;
+                const res = await fetch("/api/analyze/next-phase", { method: "POST" });
+                if (!res.ok) {
+                    const errData = await res.json();
+                    alert(`다음 단계 진행 실패: ${errData.detail || "알 수 없는 오류"}`);
+                }
+            } catch (err) {
+                console.error("다음 단계 진행 API 에러:", err);
+            }
+        });
+    }
+
     function updateStatsWidgets(results, costSummary) {
         const statTotalStudents = document.getElementById("statTotalStudents");
         const statPriorityStudents = document.getElementById("statPriorityStudents");
@@ -992,7 +1132,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (filtered.length === 0) {
             resultsTableBody.innerHTML = `
                 <tr class="empty-row">
-                    <td colspan="7">조건에 부합하는 분석 데이터가 없습니다.</td>
+                    <td colspan="8">조건에 부합하는 분석 데이터가 없습니다.</td>
                 </tr>
             `;
             return;
@@ -1004,18 +1144,38 @@ document.addEventListener("DOMContentLoaded", () => {
             else if (r.tier === "상") badgeClass = "badge-high";
             else if (r.tier === "중") badgeClass = "badge-medium";
 
-            const ruleScoreStr = r.rule_score !== undefined ? `${r.rule_score}점` : "-";
-            const aiScoreStr = r.ai_score !== undefined && r.ai_score !== "ERROR" ? `${r.ai_score}점` : "-";
-            const hallScoreStr = r.hallucination_score !== undefined && r.hallucination_score !== "" ? `${r.hallucination_score}점` : "-";
+            const studentIdStr = r.student_id ? escapeHtml(r.student_id) : "-";
+            const studentNameStr = escapeHtml(r.student_name || r.student || "-");
+
+            // 1단계 결과: stage1_rules(토큰 비소비)가 이미 끝났는지 여부로 표시
+            const stage1Str = r.rule_score !== undefined
+                ? `${r.rule_score}점`
+                : `<span style="color: var(--text-muted);">대기중</span>`;
+
+            // 2단계 결과: 아직 AI 스크리닝 전이면 "대기중" (1단계만 끝난 실시간 상태 표현)
+            const stage2Str = (r.ai_score !== undefined && r.ai_score !== "ERROR")
+                ? `${r.ai_score}점${(r.stage2 && r.stage2.error) ? " ⚠️" : ""}`
+                : `<span style="color: var(--text-muted);">대기중</span>`;
+
+            // 3단계 결과: stage3 데이터가 없으면 "미실시"(대상 아님/생략), 있으면 모순 건수·할루점수 표시
+            let stage3Str = `<span style="color: var(--text-muted);">미실시</span>`;
+            if (r.stage3 && Object.keys(r.stage3).length > 0) {
+                const hall = r.hallucination_score !== undefined && r.hallucination_score !== "" ? r.hallucination_score : (r.stage3.hallucination_score ?? "-");
+                const contradictions = r.contradictions || 0;
+                stage3Str = contradictions > 0
+                    ? `<span style="color: var(--color-danger); font-weight:600;">모순 ${contradictions}건 (할루 ${hall}점)</span>`
+                    : `할루 ${hall}점`;
+            }
 
             return `
                 <tr>
-                    <td style="font-weight: 600;">${escapeHtml(r.student)}</td>
+                    <td style="font-weight: 600;">${studentIdStr}</td>
+                    <td style="font-weight: 600;">${studentNameStr}</td>
                     <td>${escapeHtml(r.book_title || "미상")}</td>
-                    <td>${ruleScoreStr}</td>
-                    <td>${aiScoreStr}</td>
-                    <td>${hallScoreStr}</td>
-                    <td><span class="badge ${badgeClass}">${r.tier}</span></td>
+                    <td>${stage1Str}</td>
+                    <td>${stage2Str}</td>
+                    <td>${stage3Str}</td>
+                    <td><span class="badge ${badgeClass}">${r.tier || "-"}</span></td>
                     <td>
                         <div style="display: flex; gap: 6px;">
                             <button class="btn btn-sm btn-outline btn-view-detail" data-student="${escapeHtml(r.student)}">

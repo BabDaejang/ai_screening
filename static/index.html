@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=7">
+    <link rel="stylesheet" href="style.css?v=8">
 </head>
 <body>
     <div class="glass-bg"></div>
@@ -210,6 +210,14 @@
                                 강제 종료
                             </button>
                         </div>
+                        <!-- Task 5: 단계별 게이팅 — 이전 단계가 끝나야만 활성화됨 -->
+                        <button type="button" class="btn btn-primary btn-block" id="btnNextPhase" disabled style="margin-top: 10px; padding: 10px; border-radius: 6px; font-weight: 600; font-size: 13px; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                                <polygon points="5 4 15 12 5 20 5 4"></polygon>
+                                <line x1="19" y1="5" x2="19" y2="19"></line>
+                            </svg>
+                            <span id="btnNextPhaseText">다음 단계 진행</span>
+                        </button>
                     </div>
 
                     <!-- ①-C [에러 발생 상태] 컴포넌트 -->
@@ -245,6 +253,31 @@
                 </section>
                 <!-- Resizable Splitter Handle -->
                 <div class="resizer-handle" id="progressPanelResizer"></div>
+
+                <!-- Task 2: 로컬 도서 인벤토리 (실시간 분석 로그 바로 하단) -->
+                <section class="book-inventory-panel card" style="margin-bottom: 0; padding: 16px 24px;">
+                    <div class="results-header">
+                        <h3 style="font-size: 14px;">📚 로컬 도서 인벤토리 (book_cache.json)</h3>
+                        <button class="btn btn-sm btn-outline" id="btnToggleBookInventory">펼치기</button>
+                    </div>
+                    <div class="table-container book-inventory-container collapsed" id="bookInventoryContainer">
+                        <table class="data-table" id="bookInventoryTable">
+                            <thead>
+                                <tr>
+                                    <th>도서명</th>
+                                    <th>저자</th>
+                                    <th>최종 갱신</th>
+                                    <th>팩트시트</th>
+                                </tr>
+                            </thead>
+                            <tbody id="bookInventoryTableBody">
+                                <tr class="empty-row">
+                                    <td colspan="4">아직 저장된 도서 팩트시트가 없습니다.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
 
                 <!-- 통계 카드 요약 -->
                 <section class="summary-widgets">
@@ -302,18 +335,19 @@
                         <table class="data-table" id="resultsTable">
                             <thead>
                                 <tr>
-                                    <th>학생</th>
+                                    <th>학번</th>
+                                    <th>이름</th>
                                     <th>도서명</th>
-                                    <th>규칙 점수</th>
-                                    <th>AI 점수</th>
-                                    <th>할루 점수</th>
-                                    <th>판정 등급</th>
+                                    <th>1단계 결과</th>
+                                    <th>2단계 스크리닝 결과</th>
+                                    <th>3단계 검증 결과</th>
+                                    <th>최종 판정 등급</th>
                                     <th>조회</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 <tr class="empty-row">
-                                    <td colspan="7">제출물 분석을 수행하면 결과 리스트가 여기에 나타납니다.</td>
+                                    <td colspan="8">제출물 분석을 수행하면 결과 리스트가 여기에 나타납니다.</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -496,7 +530,23 @@
 
 
 
+    <!-- 4. 팩트시트 파일 뷰어 모달 (Task 2) -->
+    <div class="modal-backdrop" id="modalFactsheetView" style="display: none;">
+        <div class="modal modal-lg card">
+            <div class="modal-header">
+                <h2>📖 팩트시트 파일 열람: <span id="factsheetViewTitle">도서명</span></h2>
+                <button class="btn-close" id="btnCloseFactsheetModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="modal-desc" id="factsheetViewPath" style="font-family: 'Courier New', monospace; font-size: 12px; color: var(--text-muted);"></p>
+                <div class="markdown-body" id="factsheetViewHtml">
+                    <p class="text-center" style="color: var(--text-muted); padding:20px;">로딩 중...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- 스크립트 연결 -->
-    <script src="app.js?v=12"></script>
+    <script src="app.js?v=13"></script>
 </body>
 </html>

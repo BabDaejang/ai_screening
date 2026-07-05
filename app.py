@@ -34,13 +34,14 @@ app = FastAPI(title="AI 의심 선별 도구 웹 UI")
 
 # 전역 상태 관리
 analysis_state = {
-    "status": "idle",  # idle, running, completed, error, paused
+    "status": "idle",  # idle, running, completed, error, paused, awaiting_phase, stopped
     "progress": 0,
     "step": "",
     "logs": [],
     "results": [],
     "cost_summary": {},
-    "error_message": ""
+    "error_message": "",
+    "awaiting_phase": None,  # None | "phase2" | "phase3" — [다음 단계 진행] 버튼 게이팅용
 }
 
 # 락 객체 및 실행 제어 이벤트
@@ -48,6 +49,37 @@ state_lock = threading.Lock()
 stop_event = threading.Event()
 pause_event = threading.Event()
 pause_event.set()
+phase_gate_event = threading.Event()
+
+# 단계별 명칭 (Task 5 게이팅 UI에 표시)
+_PHASE_LABELS = {
+    "phase2": "2단계: AI 문체 스크리닝 (토큰 소비)",
+    "phase3": "3단계: 사실 검증 (토큰 소비)",
+}
+
+def wait_for_phase_gate(phase_key: str):
+    """단계 경계 게이팅(Task 3/5): 이전 단계가 완전히 끝난 뒤 자동으로 정지하고,
+    사용자가 [다음 단계 진행] 버튼을 클릭해야만 다음 단계로 진입을 허가한다.
+    토큰을 소비하는 단계(2/3단계)에 진입하기 전 반드시 이 게이트를 통과해야 하므로,
+    stage1_rules(토큰 비소비)를 생략하고 곧바로 다음 단계로 진입하는 경로가 원천 차단된다.
+    """
+    phase_label = _PHASE_LABELS.get(phase_key, phase_key)
+    phase_gate_event.clear()
+    with state_lock:
+        analysis_state["status"] = "awaiting_phase"
+        analysis_state["awaiting_phase"] = phase_key
+        analysis_state["step"] = f"[대기] {phase_label} 진입 대기 중 — [다음 단계 진행] 버튼을 클릭하세요."
+    add_log(f"⏸️ {phase_label} 진입 대기 중입니다. [다음 단계 진행] 버튼을 클릭해 주세요.")
+
+    while not phase_gate_event.is_set():
+        if stop_event.is_set():
+            raise Exception("사용자에 의해 분석이 강제 종료되었습니다.")
+        phase_gate_event.wait(timeout=1.0)
+
+    with state_lock:
+        analysis_state["status"] = "running"
+        analysis_state["awaiting_phase"] = None
+    add_log(f"▶️ 사용자 확인 완료 — {phase_label} 시작.")
 
 def check_control_state(stage_name: str, current_idx: int, total_count: int, item_id: str):
     if stop_event.is_set():
@@ -748,6 +780,9 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                 stage1_res = run_stage1(sub["text"], sub["metadata"], sub["filename"], config)
                 res_item = {
                     "student": sub["student"],
+                    "student_id": sub.get("student_id", ""),
+                    "student_name": sub.get("student_name") or sub["student"],
+                    "book_title": sub.get("book_title") or "",
                     "text": sub["text"],
                     "file_type": sub["file_type"],
                     "file_path": sub["file_path"],
@@ -760,6 +795,10 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                 # UI State Synchronization: 대상 식별 및 도서 매핑 완료 즉시 반영
                 with state_lock:
                     analysis_state["results"] = resumed_results + list(new_results)
+
+            # Task 3/5: 1단계(토큰 비소비, 로컬 규칙 기반)가 전수 완료된 뒤에만 게이트가 열린다.
+            # 사용자가 [다음 단계 진행]을 클릭하기 전까지는 토큰을 소비하는 2단계로 절대 진입하지 않는다.
+            wait_for_phase_gate("phase2")
 
             # 2단계 AI 스크리닝 (신규 대상만)
             update_progress(45, "2단계: AI 문체 스크리닝 중...")
@@ -813,6 +852,10 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
 
             with state_lock:
                 analysis_state["results"] = resumed_results + list(new_results)
+
+            # Task 3/5: 2단계가 전수 완료되어 등급이 확정된 뒤에만 게이트가 열린다.
+            # 사용자가 [다음 단계 진행]을 클릭하기 전까지는 3단계(검증)로 진입하지 않는다.
+            wait_for_phase_gate("phase3")
 
             # 3단계 사실 검증 대상자 선별 (신규 처리 대상 중에서만, no_verify가 최우선)
             update_progress(70, "3단계: 사실 검증 및 팩트시트 대조 중...")
@@ -1022,9 +1065,11 @@ def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks):
         analysis_state["results"] = []
         analysis_state["cost_summary"] = {}
         analysis_state["error_message"] = ""
+        analysis_state["awaiting_phase"] = None
         stop_event.clear()
         pause_event.set()
-        
+        phase_gate_event.clear()
+
     config = load_config()
     
     # 백그라운드 스레드에서 분석 실행
@@ -1059,11 +1104,22 @@ def resume_analysis():
 def stop_analysis():
     global analysis_state
     with state_lock:
-        if analysis_state["status"] not in ("running", "paused"):
+        if analysis_state["status"] not in ("running", "paused", "awaiting_phase"):
             raise HTTPException(status_code=400, detail="진행 중인 분석이 없습니다.")
     stop_event.set()
     pause_event.set()  # 대기 중인 스레드를 깨우기 위함
+    phase_gate_event.set()  # 단계 게이트에서 대기 중인 스레드를 깨우기 위함
     return {"message": "강제 종료 요청 완료"}
+
+@app.post("/api/analyze/next-phase")
+def next_phase_analysis():
+    """Task 5: [다음 단계 진행] 버튼 — 단계 경계에서 대기 중인 파이프라인에 진행 허가를 내린다."""
+    global analysis_state
+    with state_lock:
+        if analysis_state["status"] != "awaiting_phase":
+            raise HTTPException(status_code=400, detail="현재 다음 단계로 진행할 수 있는 대기 상태가 아닙니다.")
+    phase_gate_event.set()
+    return {"message": "다음 단계 진행 요청 완료"}
 
 @app.post("/api/analyze/reset")
 def reset_analysis():
@@ -1154,7 +1210,8 @@ def get_analysis_status():
             "step": analysis_state["step"],
             "logs": analysis_state["logs"],
             "cost_summary": analysis_state["cost_summary"],
-            "error_message": analysis_state["error_message"]
+            "error_message": analysis_state["error_message"],
+            "awaiting_phase": analysis_state.get("awaiting_phase"),
         }
 
 @app.get("/api/results")
@@ -1237,7 +1294,9 @@ def markdown_to_html(md: str) -> str:
 
 @app.get("/api/reports/{student}")
 def get_report(student: str):
-    reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "reports")
+    # run_pipeline_thread에서 generate_report(r, output_dir)를 outputs/ 디렉토리 자체에 저장하므로
+    # (outputs/reports/ 하위 폴더가 아님) 실제 저장 경로와 동일하게 맞춘다.
+    reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
     file_path = os.path.join(reports_dir, f"{student}.md")
     
     if not os.path.exists(file_path):
@@ -1255,6 +1314,62 @@ def get_report(student: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"리포트 로드 실패: {e}")
+
+# -------------------------------------------------------------
+# Task 2: 로컬 도서 인벤토리 조회 & 팩트시트 파일 뷰어 API
+# -------------------------------------------------------------
+@app.get("/api/book-inventory")
+def get_book_inventory():
+    """book_cache.json(로컬 도서 인벤토리)에 기록된 도서 목록을 최신순으로 반환합니다."""
+    book_cache = load_book_cache()
+    items = []
+    for cache_key, entry in book_cache.items():
+        items.append({
+            "cache_key": cache_key,
+            "book_title": entry.get("book_title", ""),
+            "author": entry.get("author", ""),
+            "updated_at": entry.get("updated_at", ""),
+            "is_enriched": bool(entry.get("is_enriched", False)),
+        })
+    items.sort(key=lambda x: x["updated_at"], reverse=True)
+    return {"books": items, "total": len(items)}
+
+@app.get("/api/book-inventory/{cache_key}/factsheet")
+def get_book_factsheet(cache_key: str):
+    """특정 도서(cache_key)의 팩트시트 파일을 즉시 열람합니다 (파일 핸들러 조회 → 렌더링)."""
+    book_cache = load_book_cache()
+    entry = book_cache.get(cache_key)
+    if not entry:
+        raise HTTPException(status_code=404, detail="해당 도서가 book_cache.json 인벤토리에 존재하지 않습니다.")
+
+    book_title = entry.get("book_title", "")
+    factsheets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "factsheets")
+    normalized_title = _normalize_title(book_title) if book_title else ""
+    file_path = os.path.join(factsheets_dir, f"{normalized_title}.md") if normalized_title else ""
+
+    md_content = ""
+    if file_path and os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                md_content = f.read()
+        except OSError as e:
+            logger.warning(f"팩트시트 파일 읽기 실패({file_path}): {e}")
+
+    # 로컬 .md 파일이 아직 없다면 book_cache.json에 캐시된 원문으로 대체
+    if not md_content.strip():
+        md_content = entry.get("factsheet", "")
+
+    if not md_content.strip():
+        raise HTTPException(status_code=404, detail="해당 도서의 팩트시트 데이터 라인을 찾을 수 없습니다.")
+
+    return {
+        "cache_key": cache_key,
+        "book_title": book_title,
+        "author": entry.get("author", ""),
+        "file_path": file_path,
+        "markdown": md_content,
+        "html": markdown_to_html(md_content),
+    }
 
 # -------------------------------------------------------------
 # 정적 파일 서빙
