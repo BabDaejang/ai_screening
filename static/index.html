@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=8">
+    <link rel="stylesheet" href="style.css?v=9">
 </head>
 <body>
     <div class="glass-bg"></div>
@@ -19,6 +19,17 @@
                 <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
             </svg>
             <h1>AI 의심 선별 및 사실 검증 시스템</h1>
+        </div>
+        <!-- 세션 진행 상태 파일 표시줄 (State Portability): 현재 저장 파일명·경로 상시 표기 -->
+        <div class="session-file-bar" id="sessionFileBar" title="현재 세션 진행 상태가 저장되는 파일입니다. 이 파일을 다른 컴퓨터로 옮겨 작업을 이어갈 수 있습니다.">
+            <span class="session-file-icon">💾</span>
+            <div class="session-file-meta">
+                <span class="session-file-name" id="sessionFileName">session_progress.json</span>
+                <span class="session-file-path" id="sessionFilePath">경로 확인 중...</span>
+            </div>
+            <button class="btn btn-sm btn-outline" id="btnDownloadSession" title="세션 파일 다운로드 (다른 PC로 작업 이관)">내보내기</button>
+            <button class="btn btn-sm btn-outline" id="btnUploadSession" title="다른 컴퓨터의 진행 상태 파일 업로드/복원 (파일명이 달라도 스키마가 일치하면 복원됩니다)">불러오기</button>
+            <input type="file" id="inputUploadSession" accept=".json,application/json" style="display: none;">
         </div>
         <div class="user-profile-status" id="profileStatus">
             <span class="status-indicator offline"></span>
@@ -553,7 +564,50 @@
         </div>
     </div>
 
+    <!-- 5. 3단계 심층 검증 대상 선택 모달 (듀얼 패널 Transfer List) -->
+    <div class="modal-backdrop" id="modalStage3Select" style="display: none;">
+        <div class="modal modal-xl card">
+            <div class="modal-header">
+                <h2>🎯 3단계 심층 검증 대상 선택</h2>
+                <button class="btn-close" id="btnCloseStage3Modal" title="창 닫기 (선택 대기는 유지됩니다)">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="modal-desc">
+                    1·2단계 분석 결과 위험도가 높은 학생은 <strong>미리 선택</strong>되어 있습니다.
+                    항목을 클릭하면 좌 ↔ 우 패널로 즉시 이동합니다.
+                    하단의 <strong>[최종 검증 확정]</strong>을 누르기 전까지 LLM API 호출(토큰 소모)은 발생하지 않습니다.
+                </p>
+                <div class="transfer-container">
+                    <!-- 좌측 패널: 전체/대기 명단 (이전 단계 결과 요약 뱃지 포함) -->
+                    <div class="transfer-panel">
+                        <div class="transfer-panel-header">
+                            <span>전체/대기 명단 (<strong id="stage3LeftCount">0</strong>명)</span>
+                            <button class="btn btn-sm btn-outline" id="btnStage3SelectAll">전체 선택 →</button>
+                        </div>
+                        <ul class="transfer-list" id="stage3LeftList"></ul>
+                    </div>
+                    <div class="transfer-arrows" aria-hidden="true">⇄</div>
+                    <!-- 우측 패널: 3단계 검증 대상으로 확정된 명단 -->
+                    <div class="transfer-panel transfer-panel-selected">
+                        <div class="transfer-panel-header">
+                            <span>선택된 검증 대상 (<strong id="stage3RightCount">0</strong>명)</span>
+                            <button class="btn btn-sm btn-outline" id="btnStage3ClearAll">← 전체 해제</button>
+                        </div>
+                        <ul class="transfer-list" id="stage3RightList"></ul>
+                    </div>
+                </div>
+                <div class="stage3-footer-actions">
+                    <span class="stage3-select-summary" id="stage3SelectSummary"></span>
+                    <div class="stage3-footer-buttons">
+                        <button class="btn btn-outline" id="btnStage3Skip" title="아무도 검증하지 않고 3단계를 건너뜁니다 (토큰 소모 0)">선택 없이 3단계 생략</button>
+                        <button class="btn btn-primary" id="btnStage3Confirm">✅ 최종 검증 확정</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- 스크립트 연결 -->
-    <script src="app.js?v=14"></script>
+    <script src="app.js?v=15"></script>
 </body>
 </html>

@@ -107,10 +107,38 @@ document.addEventListener("DOMContentLoaded", () => {
     const btnNextPhase = document.getElementById("btnNextPhase");
     const btnNextPhaseText = document.getElementById("btnNextPhaseText");
 
+    // 3단계 검증 대상 선택 모달 (듀얼 패널 Transfer List)
+    const modalStage3Select = document.getElementById("modalStage3Select");
+    const btnCloseStage3Modal = document.getElementById("btnCloseStage3Modal");
+    const stage3LeftList = document.getElementById("stage3LeftList");
+    const stage3RightList = document.getElementById("stage3RightList");
+    const stage3LeftCount = document.getElementById("stage3LeftCount");
+    const stage3RightCount = document.getElementById("stage3RightCount");
+    const stage3SelectSummary = document.getElementById("stage3SelectSummary");
+    const btnStage3SelectAll = document.getElementById("btnStage3SelectAll");
+    const btnStage3ClearAll = document.getElementById("btnStage3ClearAll");
+    const btnStage3Confirm = document.getElementById("btnStage3Confirm");
+    const btnStage3Skip = document.getElementById("btnStage3Skip");
+
+    // 3단계 선택 상태 (백엔드 awaiting_stage3_selection 페이로드 기반)
+    let stage3Candidates = [];          // 전체 후보 (이전 단계 결과 요약 포함)
+    let stage3SelectedSet = new Set();  // 우측 패널(검증 대상)에 있는 학생 키
+    let stage3ModalAutoOpened = false;  // 대기 상태 진입 시 1회 자동 오픈 플래그
+    let lastPipelineStatus = "";        // btnNextPhase 클릭 분기용
+
+    // 세션 진행 상태 파일 UI (State Portability)
+    const sessionFileName = document.getElementById("sessionFileName");
+    const sessionFilePath = document.getElementById("sessionFilePath");
+    const btnDownloadSession = document.getElementById("btnDownloadSession");
+    const btnUploadSession = document.getElementById("btnUploadSession");
+    const inputUploadSession = document.getElementById("inputUploadSession");
+
     // Initial Load
     fetchConfig();
     checkLoginStatus();
     fetchBookInventory();
+    fetchSessionInfo();
+    fetchLastResults(); // 서버 재기동 시 자동 복원된 이전 세션 결과를 즉시 표시
 
     // -------------------------------------------------------------
     // Event Listeners
@@ -885,8 +913,8 @@ document.addEventListener("DOMContentLoaded", () => {
             
             // 왼쪽 분석 실행 버튼 활성화
             if (btnStartAnalyze) btnStartAnalyze.disabled = false;
-        } else if (stateName === "running" || stateName === "paused" || stateName === "awaiting_phase") {
-            // 작업 진행 중 상태(단계 게이트 대기 포함): 진행 화면 활성화
+        } else if (stateName === "running" || stateName === "paused" || stateName === "awaiting_phase" || stateName === "awaiting_stage3_selection") {
+            // 작업 진행 중 상태(단계 게이트/3단계 대상 선택 대기 포함): 진행 화면 활성화
             frameStateRunning.style.display = "block";
 
             // 왼쪽 분석 실행 버튼 비활성화 (동시 실행 방지)
@@ -907,8 +935,23 @@ document.addEventListener("DOMContentLoaded", () => {
 
             // 백엔드 상태에 따른 중앙 프레임 조건부 전환
             switchFrameState(state.status);
+            lastPipelineStatus = state.status;
 
-            if (state.status === "running" || state.status === "paused" || state.status === "awaiting_phase") {
+            // 3단계 대상 선택 대기 상태: 듀얼 패널 모달 초기화 및 1회 자동 오픈
+            if (state.status === "awaiting_stage3_selection" && state.stage3_selection) {
+                if (!stage3ModalAutoOpened) {
+                    initStage3Selection(state.stage3_selection);
+                    openStage3Modal();
+                    stage3ModalAutoOpened = true;
+                }
+            } else {
+                stage3ModalAutoOpened = false;
+                if (modalStage3Select && modalStage3Select.style.display !== "none" && state.status !== "awaiting_stage3_selection") {
+                    modalStage3Select.style.display = "none"; // 확정/종료 후 잔여 모달 정리
+                }
+            }
+
+            if (state.status === "running" || state.status === "paused" || state.status === "awaiting_phase" || state.status === "awaiting_stage3_selection") {
                 if (state.step) {
                     progressStep.textContent = state.step;
                 }
@@ -929,14 +972,14 @@ document.addEventListener("DOMContentLoaded", () => {
                 await fetchBookInventory();
             }
 
-            // Task 5: 단계 게이트 대기 상태에서만 [다음 단계 진행] 버튼 활성화
+            // Task 5: 단계 게이트/3단계 대상 선택 대기 상태에서만 게이팅 버튼 활성화
             if (btnNextPhase) {
-                btnNextPhase.disabled = state.status !== "awaiting_phase";
+                btnNextPhase.disabled = state.status !== "awaiting_phase" && state.status !== "awaiting_stage3_selection";
                 if (btnNextPhaseText) {
                     if (state.status === "awaiting_phase" && state.awaiting_phase === "phase2") {
                         btnNextPhaseText.textContent = "2단계(AI 스크리닝) 진행";
-                    } else if (state.status === "awaiting_phase" && state.awaiting_phase === "phase3") {
-                        btnNextPhaseText.textContent = "3단계(사실 검증) 진행";
+                    } else if (state.status === "awaiting_stage3_selection") {
+                        btnNextPhaseText.textContent = "3단계 검증 대상 선택하기";
                     } else {
                         btnNextPhaseText.textContent = "다음 단계 진행";
                     }
@@ -980,6 +1023,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 switchFrameState("idle");
                 await fetchLastResults();
                 await fetchBookInventory();
+                await fetchSessionInfo(); // 완료 시점의 세션 스냅샷 저장 정보 갱신
                 alert("선별 분석 작업이 완료되었습니다!");
             } else if (state.status === "error") {
                 clearInterval(progressInterval);
@@ -1184,9 +1228,14 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
-    // Task 5: [다음 단계 진행] 버튼 — 단계 경계 게이트를 해제한다
+    // Task 5: [다음 단계 진행] 버튼 — 단계 경계 게이트를 해제한다.
+    // 단, 3단계 대상 선택 대기 상태에서는 즉시 진행하지 않고 듀얼 패널 모달을 연다.
     if (btnNextPhase) {
         btnNextPhase.addEventListener("click", async () => {
+            if (lastPipelineStatus === "awaiting_stage3_selection") {
+                openStage3Modal();
+                return;
+            }
             try {
                 btnNextPhase.disabled = true;
                 const res = await fetch("/api/analyze/next-phase", { method: "POST" });
@@ -1196,6 +1245,220 @@ document.addEventListener("DOMContentLoaded", () => {
                 }
             } catch (err) {
                 console.error("다음 단계 진행 API 에러:", err);
+            }
+        });
+    }
+
+    // -------------------------------------------------------------
+    // 3단계 심층 검증 대상 선택 모달 (듀얼 패널 Transfer List)
+    // -------------------------------------------------------------
+    function initStage3Selection(selectionPayload) {
+        stage3Candidates = selectionPayload.candidates || [];
+        // Auto-selection: 1·2단계 임계치 초과 위험군이 미리 체크된 상태로 초기화
+        stage3SelectedSet = new Set(selectionPayload.preselected || []);
+        renderStage3Panels();
+    }
+
+    function openStage3Modal() {
+        if (!modalStage3Select) return;
+        renderStage3Panels();
+        modalStage3Select.style.display = "flex";
+    }
+
+    // 1단계 위험도 등급(Safe/Warning/Danger) 배지 HTML 생성 (결과 테이블·모달 공용)
+    function stage1GradeBadge(record) {
+        const score = parseFloat(record.rule_score);
+        if (isNaN(score)) return "";
+        let grade = record.risk_grade;
+        if (!grade) {
+            // 하위 호환: 구버전 결과(risk_grade 없음)는 프론트에서 동일 임계값으로 산출
+            grade = score >= 45 ? "Danger" : (score >= 20 ? "Warning" : "Safe");
+        }
+        const map = {
+            "Safe": ["grade-safe", "🟢 Safe"],
+            "Warning": ["grade-warning", "🟡 Warning"],
+            "Danger": ["grade-danger", "🔴 Danger"]
+        };
+        const [cls, label] = map[grade] || map["Safe"];
+        return `<span class="badge ${cls}">${label}</span>`;
+    }
+
+    // 듀얼 패널 리스트 아이템: 이전 단계 판단 결과 요약을 뱃지로 함께 렌더링
+    function stage3ItemHtml(c, isSelected) {
+        const tierBadge = c.tier
+            ? `<span class="badge ${c.tier === "최우선" ? "badge-top-priority" : c.tier === "상" ? "badge-high" : c.tier === "중" ? "badge-medium" : "badge-low"}">${escapeHtml(c.tier)}</span>`
+            : "";
+        const signalsText = (c.signals && c.signals.length > 0)
+            ? `<span class="ti-signals" title="${escapeHtml(c.signals.join(" / "))}">⚠ ${escapeHtml(c.signals[0])}${c.signals.length > 1 ? ` 외 ${c.signals.length - 1}건` : ""}</span>`
+            : `<span class="ti-signals ti-signals-none">감지 신호 없음</span>`;
+
+        return `
+            <li class="transfer-item ${isSelected ? "transfer-item-selected" : ""}" data-student="${escapeHtml(c.student)}" title="클릭하면 ${isSelected ? "대기 명단으로 제외" : "검증 대상으로 추가"}됩니다">
+                <div class="ti-main">
+                    <span class="ti-name">${escapeHtml(c.student_name || c.student)}</span>
+                    <span class="ti-book">${escapeHtml(c.book_title || "도서 미상")}</span>
+                </div>
+                <div class="ti-badges">
+                    ${stage1GradeBadge(c)}
+                    <span class="ti-score">1단계 ${c.rule_score ?? "-"}점</span>
+                    <span class="ti-score">2단계 ${c.ai_score ?? "-"}점</span>
+                    ${tierBadge}
+                </div>
+                ${signalsText}
+                <span class="ti-toggle-icon">${isSelected ? "✕" : "＋"}</span>
+            </li>
+        `;
+    }
+
+    function renderStage3Panels() {
+        if (!stage3LeftList || !stage3RightList) return;
+
+        const leftItems = stage3Candidates.filter(c => !stage3SelectedSet.has(c.student));
+        const rightItems = stage3Candidates.filter(c => stage3SelectedSet.has(c.student));
+
+        stage3LeftList.innerHTML = leftItems.length > 0
+            ? leftItems.map(c => stage3ItemHtml(c, false)).join("")
+            : `<li class="transfer-empty">대기 중인 학생이 없습니다.</li>`;
+        stage3RightList.innerHTML = rightItems.length > 0
+            ? rightItems.map(c => stage3ItemHtml(c, true)).join("")
+            : `<li class="transfer-empty">아직 선택된 학생이 없습니다.<br>좌측 명단에서 클릭하여 추가하세요.</li>`;
+
+        stage3LeftCount.textContent = leftItems.length;
+        stage3RightCount.textContent = rightItems.length;
+        if (stage3SelectSummary) {
+            stage3SelectSummary.textContent =
+                `선택 ${rightItems.length}명 / 전체 ${stage3Candidates.length}명 — 선택된 학생만 Batch로 LLM에 전송됩니다.`;
+        }
+
+        // 원클릭 토글(Click-to-Toggle): 아이템 클릭만으로 패널 간 즉시 이동
+        modalStage3Select.querySelectorAll(".transfer-item").forEach(li => {
+            li.addEventListener("click", () => {
+                const key = li.dataset.student;
+                if (stage3SelectedSet.has(key)) {
+                    stage3SelectedSet.delete(key);
+                } else {
+                    stage3SelectedSet.add(key);
+                }
+                renderStage3Panels();
+            });
+        });
+    }
+
+    if (btnStage3SelectAll) {
+        btnStage3SelectAll.addEventListener("click", () => {
+            stage3Candidates.forEach(c => stage3SelectedSet.add(c.student));
+            renderStage3Panels();
+        });
+    }
+    if (btnStage3ClearAll) {
+        btnStage3ClearAll.addEventListener("click", () => {
+            stage3SelectedSet.clear();
+            renderStage3Panels();
+        });
+    }
+    if (btnCloseStage3Modal) {
+        // 닫기는 '보류'일 뿐 — 파이프라인은 선택 확정까지 계속 대기(토큰 소모 0)하며,
+        // [3단계 검증 대상 선택하기] 버튼으로 언제든 다시 열 수 있다.
+        btnCloseStage3Modal.addEventListener("click", () => {
+            modalStage3Select.style.display = "none";
+        });
+    }
+
+    // 최종 실행 훅(Execution Hook): 이 버튼을 눌러야만 우측 패널의 학생들이
+    // Batch 배열로 묶여 LLM으로 전송된다.
+    async function submitStage3Selection(selectedKeys) {
+        try {
+            btnStage3Confirm.disabled = true;
+            btnStage3Skip.disabled = true;
+            const res = await fetch("/api/analyze/stage3-selection", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ students: selectedKeys })
+            });
+            if (res.ok) {
+                modalStage3Select.style.display = "none";
+            } else {
+                const errData = await res.json();
+                alert(`검증 대상 확정 실패: ${errData.detail || "알 수 없는 오류"}`);
+            }
+        } catch (err) {
+            console.error("3단계 대상 확정 API 에러:", err);
+            alert("검증 대상 확정 중 통신 에러가 발생했습니다.");
+        } finally {
+            btnStage3Confirm.disabled = false;
+            btnStage3Skip.disabled = false;
+        }
+    }
+
+    if (btnStage3Confirm) {
+        btnStage3Confirm.addEventListener("click", async () => {
+            const selected = stage3Candidates
+                .filter(c => stage3SelectedSet.has(c.student))
+                .map(c => c.student);
+            if (selected.length === 0) {
+                if (!confirm("선택된 학생이 없습니다. 3단계 검증을 건너뛰시겠습니까? (토큰 소모 0)")) return;
+            }
+            await submitStage3Selection(selected);
+        });
+    }
+    if (btnStage3Skip) {
+        btnStage3Skip.addEventListener("click", async () => {
+            if (!confirm("3단계 심층 검증을 완전히 생략하시겠습니까? (선택된 학생이 있어도 검증하지 않습니다)")) return;
+            await submitStage3Selection([]);
+        });
+    }
+
+    // -------------------------------------------------------------
+    // 세션 진행 상태 파일 UI (State Portability — 작업 이어하기/공유)
+    // -------------------------------------------------------------
+    async function fetchSessionInfo() {
+        try {
+            const res = await fetch("/api/session/info");
+            if (!res.ok) return;
+            const info = await res.json();
+            if (sessionFileName) sessionFileName.textContent = info.filename || "session_progress.json";
+            if (sessionFilePath) {
+                const savedStr = info.exists
+                    ? `최종 저장 ${info.saved_at || "미상"} · ${info.student_count}명`
+                    : "저장 이력 없음 (분석 시작 시 자동 생성)";
+                sessionFilePath.textContent = `${info.path} — ${savedStr}`;
+                sessionFilePath.title = info.path;
+            }
+            if (btnDownloadSession) btnDownloadSession.disabled = !info.exists;
+        } catch (err) {
+            console.error("세션 파일 정보 조회 에러:", err);
+        }
+    }
+
+    if (btnDownloadSession) {
+        btnDownloadSession.addEventListener("click", () => {
+            window.location.href = "/api/session/download";
+        });
+    }
+    if (btnUploadSession && inputUploadSession) {
+        btnUploadSession.addEventListener("click", () => inputUploadSession.click());
+        inputUploadSession.addEventListener("change", async () => {
+            const file = inputUploadSession.files[0];
+            if (!file) return;
+            const formData = new FormData();
+            formData.append("file", file);
+            try {
+                btnUploadSession.disabled = true;
+                const res = await fetch("/api/session/upload", { method: "POST", body: formData });
+                const data = await res.json();
+                if (res.ok) {
+                    alert(data.message || "세션 복원 완료");
+                    await fetchLastResults();
+                    await fetchSessionInfo();
+                } else {
+                    alert(`세션 복원 실패: ${data.detail || "알 수 없는 오류"}`);
+                }
+            } catch (err) {
+                console.error("세션 업로드 에러:", err);
+                alert("세션 파일 업로드 중 통신 에러가 발생했습니다.");
+            } finally {
+                btnUploadSession.disabled = false;
+                inputUploadSession.value = "";
             }
         });
     }
@@ -1243,9 +1506,9 @@ document.addEventListener("DOMContentLoaded", () => {
             const studentIdStr = r.student_id ? escapeHtml(r.student_id) : "-";
             const studentNameStr = escapeHtml(r.student_name || r.student || "-");
 
-            // 1단계 결과: stage1_rules(토큰 비소비)가 이미 끝났는지 여부로 표시
+            // 1단계 결과: 점수 + 위험도 등급 배지 (Safe/Warning/Danger — 토큰 비소비 로컬 판정)
             const stage1Str = r.rule_score !== undefined
-                ? `${r.rule_score}점`
+                ? `${r.rule_score}점 ${stage1GradeBadge(r)}`
                 : `<span style="color: var(--text-muted);">대기중</span>`;
 
             // 2단계 결과: 아직 AI 스크리닝 전이면 "대기중" (1단계만 끝난 실시간 상태 표현)

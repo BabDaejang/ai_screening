@@ -11,21 +11,9 @@ from providers.base import LLMProvider
 
 logger = logging.getLogger(__name__)
 
-# 팩트시트 생성용 시스템 프롬프트
-_FACTSHEET_SYSTEM_PROMPT = """당신은 도서 사실 검증 전문가입니다. 웹 검색을 활용하여 주어진 도서에 대한 팩트시트를 작성하세요.
-
-팩트시트에 반드시 포함할 항목:
-1. **저자/출판사 정보**: 저자 이력, 출판 연도, 출판사
-2. **주요 등장인물**: 이름, 역할, 관계
-3. **챕터 구조**: 각 장의 제목과 핵심 내용 요약
-4. **핵심 사건 순서**: 시간순으로 정리된 주요 플롯 포인트
-5. **자주 인용되는 구절**: 유명 인용문이나 핵심 문장
-6. **자주 혼동되는 항목**: 비슷한 이름의 인물, 헷갈리는 사건 등
-
-중요 규칙:
-- 확인할 수 없는 정보는 반드시 '미확인'으로 표기하세요.
-- 추측으로 정보를 채우지 마세요.
-- 마크다운 형식으로 작성하세요."""
+# 팩트시트 생성용 시스템 프롬프트 — stages/factsheet_prompt.py에서 단일 관리
+# (메타 정보 10% 이내 / 책 내용 90% 이상 강제, 전 프로바이더 공용)
+from stages.factsheet_prompt import FACTSHEET_SYSTEM_PROMPT as _FACTSHEET_SYSTEM_PROMPT
 
 # 검증 지침
 _VERIFICATION_INSTRUCTION = """당신은 도서 독후감/독서 제출물의 사실 검증 전문가입니다.

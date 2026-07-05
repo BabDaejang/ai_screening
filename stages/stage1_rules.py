@@ -240,6 +240,98 @@ def check_structural_homogeneity(text: str, config: dict) -> dict[str, Any]:
     return {"score": round(score, 2), "evidence": evidence}
 
 
+def check_sentence_variance(text: str, config: dict) -> dict[str, Any]:
+    """문장 길이 분산(균일성) 검사 — 토큰 소모 0의 로컬 휴리스틱.
+
+    AI 생성문은 문장 길이가 기계적으로 균일한 경향이 있다.
+    문장 길이의 변동계수(CV = std/mean)가 임계값 미만이면 의심 점수를 부여한다.
+    (기존 structural_homogeneity는 '문단' 단위 CV만 점수화했고, 문장 CV는
+    참고 지표로만 계산되던 것을 독립 점수 항목으로 승격한 검사이다.)
+    """
+    rules = config.get("rules", {}).get("sentence_variance", {})
+    cv_threshold: float = rules.get("cv_threshold", 0.35)
+    min_sentences: int = rules.get("min_sentences", 8)
+
+    sentences = [s.strip() for s in re.split(r"[.!?。]\s*", text) if s.strip()]
+
+    if len(sentences) < min_sentences:
+        return {
+            "score": 0.0,
+            "evidence": [{
+                "reason": f"문장 수 부족 ({len(sentences)}개 < 최소 {min_sentences}개)",
+            }],
+        }
+
+    lengths = [len(s) for s in sentences]
+    mean_len = statistics.mean(lengths)
+    std_len = statistics.stdev(lengths) if len(lengths) > 1 else 0.0
+    cv = std_len / mean_len if mean_len > 0 else 0.0
+
+    if cv < cv_threshold:
+        score = (1 - cv / cv_threshold) * 100.0
+    else:
+        score = 0.0
+
+    evidence = [{
+        "sentence_cv": round(cv, 4),
+        "sentence_mean": round(mean_len, 1),
+        "sentence_std": round(std_len, 1),
+        "sentence_count": len(sentences),
+        "cv_threshold": cv_threshold,
+    }]
+
+    return {"score": round(score, 2), "evidence": evidence}
+
+
+def check_lexical_diversity(text: str, config: dict) -> dict[str, Any]:
+    """어휘 다양성(MATTR) 검사 — 토큰 소모 0의 로컬 휴리스틱.
+
+    학생의 자연스러운 글은 같은 어절을 반복하는 경향이 있는 반면,
+    AI 생성문은 동어 반복을 회피해 어휘 다양성이 비정상적으로 높게 나온다.
+    단순 TTR은 글 길이에 반비례해 왜곡되므로, 고정 윈도우를 슬라이딩하며
+    평균을 내는 MATTR(Moving-Average Type-Token Ratio)을 사용한다.
+    """
+    rules = config.get("rules", {}).get("lexical_diversity", {})
+    mattr_threshold: float = rules.get("mattr_threshold", 0.90)
+    window: int = rules.get("window", 100)
+    min_tokens: int = rules.get("min_tokens", 80)
+
+    # 어절 단위 토큰화 (한글·영숫자 연속체)
+    tokens = re.findall(r"[가-힣a-zA-Z0-9]+", text)
+
+    if len(tokens) < min_tokens:
+        return {
+            "score": 0.0,
+            "evidence": [{
+                "reason": f"토큰 수 부족 ({len(tokens)}개 < 최소 {min_tokens}개)",
+            }],
+        }
+
+    if len(tokens) <= window:
+        mattr = len(set(tokens)) / len(tokens)
+    else:
+        ratios = []
+        for i in range(0, len(tokens) - window + 1):
+            chunk = tokens[i:i + window]
+            ratios.append(len(set(chunk)) / window)
+        mattr = statistics.mean(ratios)
+
+    if mattr > mattr_threshold:
+        score = min(100.0, (mattr - mattr_threshold) / (1.0 - mattr_threshold) * 100.0)
+    else:
+        score = 0.0
+
+    evidence = [{
+        "mattr": round(mattr, 4),
+        "mattr_threshold": mattr_threshold,
+        "window": window,
+        "token_count": len(tokens),
+        "unique_token_count": len(set(tokens)),
+    }]
+
+    return {"score": round(score, 2), "evidence": evidence}
+
+
 def check_metadata_anomaly(
     metadata: dict | None,
     filename: str,
@@ -318,6 +410,23 @@ def check_metadata_anomaly(
 # 메인 함수
 # ──────────────────────────────────────────────
 
+def grade_from_score(rule_score: float, config: dict) -> str:
+    """rule_score(0-100)를 UI 표시용 위험도 등급으로 변환한다.
+
+    Safe(안전) / Warning(주의) / Danger(위험) 3단계.
+    임계값은 config.stage1_grade에서 조정 가능하다.
+    """
+    grade_cfg = config.get("stage1_grade", {})
+    warning_threshold: float = grade_cfg.get("warning_threshold", 20)
+    danger_threshold: float = grade_cfg.get("danger_threshold", 45)
+
+    if rule_score >= danger_threshold:
+        return "Danger"
+    if rule_score >= warning_threshold:
+        return "Warning"
+    return "Safe"
+
+
 def run_stage1(
     text: str,
     metadata: dict | None,
@@ -347,13 +456,15 @@ def run_stage1(
     """
     weights: dict[str, float] = config.get("weights", {})
 
-    # 각 검사 실행
+    # 각 검사 실행 (전부 로컬 연산 — LLM API 호출/토큰 소모 0)
     details: dict[str, dict[str, Any]] = {
         "special_chars": check_special_chars(text, config),
         "markdown_remnants": check_markdown_remnants(text, config),
         "chatbot_phrases": check_chatbot_phrases(text, config),
         "paste_artifacts": check_paste_artifacts(text, config),
         "structural_homogeneity": check_structural_homogeneity(text, config),
+        "sentence_variance": check_sentence_variance(text, config),
+        "lexical_diversity": check_lexical_diversity(text, config),
         "metadata_anomaly": check_metadata_anomaly(metadata, filename, config),
     }
 
@@ -370,5 +481,7 @@ def run_stage1(
 
     return {
         "rule_score": rule_score,
+        # UI 시각화용 3단계 위험도 등급 (Safe / Warning / Danger)
+        "risk_grade": grade_from_score(rule_score, config),
         "details": details,
     }

@@ -24,6 +24,13 @@ from utils.cost_tracker import CostTracker
 from utils.docx_metadata import extract_docx_metadata
 from utils.file_reader import read_submissions
 from utils.report_generator import generate_csv, generate_report, calculate_tiers
+from utils.session_store import (
+    save_session_progress,
+    load_session_progress,
+    parse_session_payload,
+    session_file_info,
+    SESSION_FILE_PATH,
+)
 from providers import create_provider
 from stages.stage1_rules import run_stage1
 from stages.stage2_screening import run_stage2
@@ -36,7 +43,7 @@ app = FastAPI(title="AI 의심 선별 도구 웹 UI")
 
 # 전역 상태 관리
 analysis_state = {
-    "status": "idle",  # idle, running, completed, error, paused, awaiting_phase, stopped
+    "status": "idle",  # idle, running, completed, error, paused, awaiting_phase, awaiting_stage3_selection, stopped
     "progress": 0,
     "step": "",
     "logs": [],
@@ -44,6 +51,7 @@ analysis_state = {
     "cost_summary": {},
     "error_message": "",
     "awaiting_phase": None,  # None | "phase2" | "phase3" — [다음 단계 진행] 버튼 게이팅용
+    "stage3_selection": None,  # awaiting_stage3_selection 상태에서 듀얼 패널 모달용 후보 페이로드
 }
 
 # 락 객체 및 실행 제어 이벤트
@@ -52,6 +60,10 @@ stop_event = threading.Event()
 pause_event = threading.Event()
 pause_event.set()
 phase_gate_event = threading.Event()
+
+# 3단계 사용자 주도형 대상 선택 게이트 (듀얼 패널 모달의 [최종 검증 확정]이 해제)
+stage3_selection_event = threading.Event()
+stage3_selected = {"keys": None}  # 사용자가 확정한 학생 키 목록
 
 # 단계별 명칭 (Task 5 게이팅 UI에 표시)
 _PHASE_LABELS = {
@@ -82,6 +94,45 @@ def wait_for_phase_gate(phase_key: str):
         analysis_state["status"] = "running"
         analysis_state["awaiting_phase"] = None
     add_log(f"▶️ 사용자 확인 완료 — {phase_label} 시작.")
+
+def wait_for_stage3_selection(candidates_payload: list, preselected_keys: list) -> list:
+    """3단계(토큰 소비) 진입 전 '사용자 주도형 대상 확정' 게이트.
+
+    [3단계 시작] 시 즉시 LLM을 호출하지 않고, 듀얼 패널(Transfer List) 모달에서
+    사용자가 [최종 검증 확정]을 누를 때까지 대기한다. 대기 중에는 어떤 API도
+    호출되지 않으므로 토큰 소모는 0이다. 모달 로딩 시 preselected_keys(1·2단계
+    분석 결과가 임계치를 초과한 위험군)가 미리 체크된 상태로 초기화된다.
+
+    Returns:
+        사용자가 확정한 학생 키 목록.
+    """
+    stage3_selection_event.clear()
+    stage3_selected["keys"] = None
+    with state_lock:
+        analysis_state["status"] = "awaiting_stage3_selection"
+        analysis_state["awaiting_phase"] = "phase3"
+        analysis_state["stage3_selection"] = {
+            "candidates": candidates_payload,
+            "preselected": preselected_keys,
+        }
+        analysis_state["step"] = "[대기] 3단계 심층 검증 대상 선택 대기 중 — [3단계 대상 선택] 창에서 확정하세요."
+    add_log(
+        f"⏸️ 3단계 진입 대기 — 듀얼 패널 창에서 검증 대상을 확정해 주세요. "
+        f"(위험군 {len(preselected_keys)}명 자동 선택됨 / 확정 전까지 API 호출·토큰 소모 0)"
+    )
+
+    while not stage3_selection_event.is_set():
+        if stop_event.is_set():
+            raise Exception("사용자에 의해 분석이 강제 종료되었습니다.")
+        stage3_selection_event.wait(timeout=1.0)
+
+    with state_lock:
+        analysis_state["status"] = "running"
+        analysis_state["awaiting_phase"] = None
+        analysis_state["stage3_selection"] = None
+    selected = list(stage3_selected["keys"] or [])
+    add_log(f"▶️ 사용자 확정 완료 — 3단계 심층 검증 대상 {len(selected)}명을 Batch로 검증합니다.")
+    return selected
 
 def check_control_state(stage_name: str, current_idx: int, total_count: int, item_id: str):
     if stop_event.is_set():
@@ -198,6 +249,25 @@ def normalize_cache_key(title: str, author: str) -> str:
     cleaned_title = re.sub(r'[\s\\/:*?"<>|]', '', title).strip()
     cleaned_author = re.sub(r'[\s\\/:*?"<>|]', '', author).strip()
     return f"{cleaned_title}_{cleaned_author}"
+
+def find_cached_book_entry_by_title(book_title: str, book_cache: dict) -> Optional[tuple]:
+    """도서명만으로 book_cache.json의 기존 엔트리를 탐색한다 (title-first 폴백).
+
+    캐시 키는 '도서명_저자명' 조합이라서 저자가 미상이면 키 조회가 불가능했고,
+    이 때문에 이미 캐시에 있는 책인데도 저자 역추적(lookup_author) LLM 호출이
+    먼저 발생하는 토큰 누수가 있었다. 도서명 정규화 일치로 기존 엔트리를 먼저
+    찾아 저자·팩트시트를 재사용하면 캐시 히트 시 LLM 호출이 완전히 0이 된다.
+
+    Returns:
+        (cache_key, entry) 또는 None.
+    """
+    target = _normalize_title(book_title or "")
+    if not target:
+        return None
+    for cache_key, entry in book_cache.items():
+        if _normalize_title(entry.get("book_title", "") or "") == target:
+            return cache_key, entry
+    return None
 
 # '도서명(저자명)' 또는 '도서명[저자명]' 복합 텍스트에서 후미 괄호를 캡처한다.
 _TITLE_AUTHOR_PATTERN = re.compile(r'^(.+?)\s*[\(\[](.+?)[\)\]]$')
@@ -816,6 +886,13 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
         # CostTracker 설정
         cost_tracker = CostTracker(config)
 
+        # [토큰 최적화 대안 — 구조적 제안]
+        # 1) Anthropic Prompt Caching: 동일 도서를 읽은 학생 N명 연속 검증 시 팩트시트를
+        #    system 블록 cache_control로 지정하면 2번째 호출부터 입력 토큰이 캐시 단가(≈1/10)로 과금.
+        # 2) 로컬 임베딩(SentenceTransformers) 1차 유사도 필터링: 학생 글 ↔ 팩트시트 문단 간
+        #    코사인 유사도로 무관한 주장을 사전 제거하면 3단계 verify 입력 토큰 추가 절감.
+        add_log("💡 [최적화 제안] 동일 도서 반복 검증에는 Prompt Caching, 검증 전 로컬 임베딩(SentenceTransformers) 1차 필터링을 적용하면 토큰을 추가 절감할 수 있습니다.")
+
         # -----------------------------------------------------------------
         # 체크포인트-재개(Resume) 로직: screening_results.jsonl 스캔 → 완료 인덱스 로드
         # 매 루프 진입 전 [학번_성명]이 완료 인덱스에 있으면 전체 파이프라인을 스킵하여
@@ -844,10 +921,14 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
 
         def _finalize_and_persist_student(r: dict):
             """피실험자 1명(Atomic Unit)의 처리가 최종 완료되는 즉시 로컬 파일에
-            append-only로 영속화하고, 동시에 상위 UI 레이어에 실시간으로 반영한다."""
+            append-only로 영속화하고, 동시에 상위 UI 레이어에 실시간으로 반영한다.
+            세션 스냅샷(session_progress.json)도 함께 갱신하여, 서버가 언제
+            재기동되더라도(또는 파일을 타 PC로 옮기더라도) 이어서 작업할 수 있다."""
             append_screening_result(r)
             with state_lock:
                 analysis_state["results"] = resumed_results + list(new_results)
+                snapshot = list(analysis_state["results"])
+            save_session_progress(snapshot, status="running")
 
         if not submissions_to_process:
             add_log("✅ 모든 대상이 체크포인트에 이미 존재하여 신규 스크리닝을 생략합니다.")
@@ -872,6 +953,8 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                     "file_path": sub["file_path"],
                     "metadata": sub["metadata"],
                     "rule_score": stage1_res["rule_score"],
+                    # 1단계 위험도 등급 (Safe/Warning/Danger) — UI 배지 시각화용
+                    "risk_grade": stage1_res.get("risk_grade", ""),
                     "rule_details": stage1_res["details"]
                 }
                 new_results.append(res_item)
@@ -916,7 +999,21 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                                  if r.get("book_title") == book_title and r.get("author")),
                                 None,
                             )
-                            author = pre_extracted_author or lookup_author(book_title, provider_verify_prefetch)
+                            if pre_extracted_author:
+                                author = pre_extracted_author
+                            else:
+                                # Title-first 캐시 폴백: 저자 미상이라도 도서명 정규화 일치로
+                                # 기존 캐시 엔트리를 먼저 탐색하여, 캐시 히트 시 저자 역추적
+                                # LLM 호출까지 완전히 생략한다 (Cache Hit → 토큰 소모 0).
+                                cached_hit = find_cached_book_entry_by_title(book_title, book_cache)
+                                if cached_hit:
+                                    author = cached_hit[1].get("author") or "Unknown"
+                                    add_log(
+                                        f"💾 캐시 재사용: '{book_title}' 저자('{author}')를 "
+                                        f"book_cache.json에서 복원 — 저자 역추적 LLM 호출 생략 (토큰 0)"
+                                    )
+                                else:
+                                    author = lookup_author(book_title, provider_verify_prefetch)
                             book_author_map[book_title] = author
                             ensure_book_factsheet_cached(
                                 book_title, author, provider_verify_prefetch,
@@ -979,21 +1076,44 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
             with state_lock:
                 analysis_state["results"] = resumed_results + list(new_results)
 
-            # Task 3/5: 2단계가 전수 완료되어 등급이 확정된 뒤에만 게이트가 열린다.
-            # 사용자가 [다음 단계 진행]을 클릭하기 전까지는 3단계(검증)로 진입하지 않는다.
-            wait_for_phase_gate("phase3")
-
-            # 3단계 사실 검증 대상자 선별 (신규 처리 대상 중에서만, no_verify가 최우선)
-            update_progress(70, "3단계: 사실 검증 및 팩트시트 대조 중...")
+            # 3단계 사실 검증 대상자 확정 (사용자 주도형 듀얼 패널 선택, no_verify가 최우선)
             if req.no_verify:
                 add_log("[3단계] 옵션에 의해 사실 검증을 생략합니다.")
                 candidates = []
-            elif req.verify_all:
-                candidates = list(new_results)
-                add_log("[3단계] 모든 신규 학생을 대상으로 검증을 진행합니다.")
             else:
-                candidates = [r for r in new_results if r.get("tier") in ("상", "최우선")]
-                add_log(f"[3단계] 선별 대상자: {len(candidates)}명")
+                # 듀얼 패널 모달용 후보 페이로드: 각 학생 항목에 이전 단계(1·2단계)
+                # 판단 결과 요약을 함께 실어 좌측 패널의 뱃지로 렌더링된다.
+                selection_payload = []
+                for r in new_results:
+                    stage2_info = r.get("stage2") or {}
+                    selection_payload.append({
+                        "student": r["student"],
+                        "student_id": r.get("student_id", ""),
+                        "student_name": r.get("student_name") or r["student"],
+                        "book_title": r.get("book_title") or stage2_info.get("book_title") or "",
+                        "rule_score": r.get("rule_score", 0),
+                        "risk_grade": r.get("risk_grade", ""),
+                        "ai_score": r.get("ai_score", 0),
+                        "signals": (stage2_info.get("signals") or [])[:3],
+                        "tier": r.get("tier", ""),
+                    })
+
+                # 초기 자동 선택(Auto-selection): 1·2단계 결과가 임계치를 초과한
+                # 위험군(tier 상/최우선)을 미리 체크. verify_all 옵션이면 전원 선택.
+                if req.verify_all:
+                    preselected_keys = [r["student"] for r in new_results]
+                else:
+                    preselected_keys = [
+                        r["student"] for r in new_results
+                        if r.get("tier") in ("상", "최우선")
+                    ]
+
+                # 사용자가 [최종 검증 확정]을 누를 때까지 대기 (그동안 토큰 소모 0).
+                selected_keys = set(wait_for_stage3_selection(selection_payload, preselected_keys))
+                candidates = [r for r in new_results if r["student"] in selected_keys]
+                add_log(f"[3단계] 사용자 확정 검증 대상: {len(candidates)}명")
+
+            update_progress(70, "3단계: 사실 검증 및 팩트시트 대조 중...")
 
             candidate_keys = {c["student"] for c in candidates}
             non_candidates = [r for r in new_results if r["student"] not in candidate_keys]
@@ -1026,9 +1146,16 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                             or cand.get("author")
                         )
                         if not author or author.strip() == "":
-                            add_log(f"🔍 '{book_title}' 도서의 저자 정보 누락 감지. 저자 역추적 중...")
-                            author = lookup_author(book_title, provider_verify)
-                            add_log(f"✅ 저자 추적 완료: '{book_title}' -> '{author}'")
+                            # Title-first 캐시 폴백: 역추적 LLM 호출 전에 도서명만으로
+                            # 기존 캐시 엔트리를 탐색한다 (Cache Hit → 토큰 소모 0).
+                            cached_hit = find_cached_book_entry_by_title(book_title, book_cache)
+                            if cached_hit:
+                                author = cached_hit[1].get("author") or "Unknown"
+                                add_log(f"💾 캐시 재사용: '{book_title}' 저자('{author}') 복원 — 역추적 LLM 호출 생략 (토큰 0)")
+                            else:
+                                add_log(f"🔍 '{book_title}' 도서의 저자 정보 누락 감지. 저자 역추적 중...")
+                                author = lookup_author(book_title, provider_verify)
+                                add_log(f"✅ 저자 추적 완료: '{book_title}' -> '{author}'")
                             book_author_map[book_title] = author
 
                         # 데이터 구조에 강제 업데이트하여 데이터 유실 방지
@@ -1124,7 +1251,11 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
             analysis_state["step"] = "분석 완료"
             analysis_state["results"] = results
             analysis_state["cost_summary"] = cost_summary
-            
+
+        # 최종 세션 스냅샷 저장 (State Portability — 타 PC에서 이어하기 가능)
+        save_session_progress(results, cost_summary, status="completed")
+        add_log(f"💾 세션 진행 상태 저장 완료: {SESSION_FILE_PATH}")
+
         add_log("🎉 전체 파이프라인 분석이 성공적으로 끝났습니다!")
         
     except Exception as e:
@@ -1162,9 +1293,12 @@ def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks):
         analysis_state["cost_summary"] = {}
         analysis_state["error_message"] = ""
         analysis_state["awaiting_phase"] = None
+        analysis_state["stage3_selection"] = None
         stop_event.clear()
         pause_event.set()
         phase_gate_event.clear()
+        stage3_selection_event.clear()
+        stage3_selected["keys"] = None
 
     config = load_config()
     
@@ -1200,11 +1334,12 @@ def resume_analysis():
 def stop_analysis():
     global analysis_state
     with state_lock:
-        if analysis_state["status"] not in ("running", "paused", "awaiting_phase"):
+        if analysis_state["status"] not in ("running", "paused", "awaiting_phase", "awaiting_stage3_selection"):
             raise HTTPException(status_code=400, detail="진행 중인 분석이 없습니다.")
     stop_event.set()
     pause_event.set()  # 대기 중인 스레드를 깨우기 위함
     phase_gate_event.set()  # 단계 게이트에서 대기 중인 스레드를 깨우기 위함
+    stage3_selection_event.set()  # 3단계 대상 선택 게이트에서 대기 중인 스레드를 깨우기 위함
     return {"message": "강제 종료 요청 완료"}
 
 @app.post("/api/analyze/next-phase")
@@ -1216,6 +1351,31 @@ def next_phase_analysis():
             raise HTTPException(status_code=400, detail="현재 다음 단계로 진행할 수 있는 대기 상태가 아닙니다.")
     phase_gate_event.set()
     return {"message": "다음 단계 진행 요청 완료"}
+
+class Stage3SelectionRequest(BaseModel):
+    students: list[str]
+
+@app.post("/api/analyze/stage3-selection")
+def confirm_stage3_selection(req: Stage3SelectionRequest):
+    """듀얼 패널 모달의 [최종 검증 확정] 실행 훅.
+
+    우측 패널에 적재된 학생 키 배열을 받아 3단계 Batch 검증 대상으로 확정하고,
+    선택 게이트에서 대기 중인 파이프라인 스레드를 깨운다. 이 호출이 오기 전까지
+    파이프라인은 어떤 LLM API도 호출하지 않는다 (토큰 소모 0 대기).
+    """
+    global analysis_state
+    with state_lock:
+        if analysis_state["status"] != "awaiting_stage3_selection":
+            raise HTTPException(status_code=400, detail="현재 3단계 대상 선택 대기 상태가 아닙니다.")
+        valid_keys = {
+            c["student"] for c in (analysis_state.get("stage3_selection") or {}).get("candidates", [])
+        }
+
+    # 후보 목록에 없는 키는 무시 (중복 제거 + 순서 보존)
+    selected = [s for s in dict.fromkeys(req.students) if s in valid_keys]
+    stage3_selected["keys"] = selected
+    stage3_selection_event.set()
+    return {"message": f"3단계 검증 대상 {len(selected)}명 확정 완료", "selected_count": len(selected)}
 
 @app.post("/api/analyze/reset")
 def reset_analysis():
@@ -1308,6 +1468,7 @@ def get_analysis_status():
             "cost_summary": analysis_state["cost_summary"],
             "error_message": analysis_state["error_message"],
             "awaiting_phase": analysis_state.get("awaiting_phase"),
+            "stage3_selection": analysis_state.get("stage3_selection"),
         }
 
 @app.get("/api/results")
@@ -1471,6 +1632,9 @@ async def import_csv(file: UploadFile = File(...)):
         analysis_state["status"] = "idle"
         analysis_state["error_message"] = ""
 
+    # CSV 복구 내용도 세션 스냅샷에 동기화 (재기동 시 자동 복원 대상)
+    save_session_progress(imported, status="restored")
+
     msg = f"CSV 업로드 복구 완료: 총 {len(imported)}명 로드, 체크포인트 백필 {backfilled}명, 재처리 필요(Delta) {incomplete}명"
     add_log(f"📥 {msg}")
 
@@ -1479,6 +1643,87 @@ async def import_csv(file: UploadFile = File(...)):
         "total": len(imported),
         "backfilled": backfilled,
         "incomplete": incomplete,
+    }
+
+# -------------------------------------------------------------
+# 세션 진행 상태 파일 API (State Portability — 작업 이어하기 및 파일 공유)
+# book_cache.json(글로벌 도서 캐시)과는 완전히 분리된 세션 전용 파일이다.
+# -------------------------------------------------------------
+@app.get("/api/session/info")
+def get_session_info():
+    """UI 상단 표기용: 현재 저장 중인 세션 파일명·경로·최종 저장 시각."""
+    return session_file_info()
+
+@app.get("/api/session/download")
+def download_session_file():
+    """session_progress.json을 그대로 다운로드한다 (타 PC로 작업 이관용)."""
+    if not os.path.exists(SESSION_FILE_PATH):
+        raise HTTPException(status_code=404, detail="아직 저장된 세션 진행 상태 파일이 없습니다.")
+    return FileResponse(
+        SESSION_FILE_PATH,
+        media_type="application/json",
+        filename=os.path.basename(SESSION_FILE_PATH),
+    )
+
+@app.post("/api/session/upload")
+async def upload_session_file(file: UploadFile = File(...)):
+    """진행 상태 파일을 업로드하여 세션을 복원(Resume)한다.
+
+    - 파일 이름이 변경되어 있어도 내용 스키마(schema/version)만 일치하면 복원된다.
+    - 완전히 처리된 학생은 screening_results.jsonl 체크포인트에 백필되어,
+      다음 분석 실행 시 자동으로 스킵된다 (중복 API 호출/토큰 소모 0).
+    """
+    with state_lock:
+        if analysis_state["status"] in ("running", "paused", "awaiting_phase", "awaiting_stage3_selection"):
+            raise HTTPException(status_code=400, detail="분석이 진행 중일 때는 세션을 복원할 수 없습니다. 먼저 정지해 주세요.")
+
+    try:
+        raw_bytes = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"파일 읽기 실패: {e}")
+
+    try:
+        data = parse_session_payload(raw_bytes)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"세션 파일 검증 실패: {e}")
+
+    results = data["results"]
+
+    # 완료된 학생을 체크포인트(jsonl)에 백필 → 재분석 시 자동 스킵 (Resume 엔진 재사용)
+    completed_map = load_completed_results()
+    backfilled = 0
+    incomplete = 0
+    for r in results:
+        is_complete = r.get("rule_score") is not None and r.get("ai_score") is not None
+        if is_complete and r.get("tier") in ("상", "최우선") and r.get("hallucination_score") in (None, ""):
+            is_complete = False
+        if is_complete and r["student"] not in completed_map:
+            append_screening_result(r)
+            completed_map[r["student"]] = r
+            backfilled += 1
+        elif not is_complete:
+            incomplete += 1
+
+    with state_lock:
+        analysis_state["results"] = results
+        analysis_state["cost_summary"] = data.get("cost_summary", {})
+        analysis_state["status"] = "idle"
+        analysis_state["error_message"] = ""
+
+    # 업로드된 내용을 현재 세션 파일로 저장 (이후 이 컴퓨터에서 계속 이어짐)
+    save_session_progress(results, data.get("cost_summary"), status="restored")
+
+    msg = (
+        f"세션 복원 완료 (원본 저장 시각: {data.get('saved_at', '미상')}): "
+        f"총 {len(results)}명 로드, 체크포인트 백필 {backfilled}명, 재처리 필요 {incomplete}명"
+    )
+    add_log(f"📥 {msg}")
+    return {
+        "message": msg,
+        "total": len(results),
+        "backfilled": backfilled,
+        "incomplete": incomplete,
+        "saved_at": data.get("saved_at"),
     }
 
 def markdown_to_html(md: str) -> str:
@@ -1644,6 +1889,23 @@ app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 # 싱글톤 UserManager 인스턴스
 # -------------------------------------------------------------
 global_user_manager = UserManager()
+
+# -------------------------------------------------------------
+# 서버 기동 시 세션 자동 복원 (State Persistence):
+# 마지막 session_progress.json 스냅샷이 있으면 결과 목록을 즉시 복구하여
+# 재기동 후에도 UI에서 이전 작업을 그대로 이어볼 수 있게 한다.
+# -------------------------------------------------------------
+_restored_session = load_session_progress()
+if _restored_session and _restored_session.get("results"):
+    with state_lock:
+        analysis_state["results"] = _restored_session["results"]
+        analysis_state["cost_summary"] = _restored_session.get("cost_summary", {})
+    logger.info(
+        "이전 세션 자동 복원 완료: %d명 (저장 시각: %s, 파일: %s)",
+        len(_restored_session["results"]),
+        _restored_session.get("saved_at", "미상"),
+        SESSION_FILE_PATH,
+    )
 
 # 앱 실행 시 모든 프로필의 API 키를 모아 모델 캐시를 백그라운드에서 동적 갱신
 trigger_bg_refresh_all_profiles()

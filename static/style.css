@@ -1600,3 +1600,217 @@ body {
     background: var(--color-primary);
     height: 8px;
 }
+
+/* =============================================================
+   1단계 위험도 등급 배지 (Safe / Warning / Danger)
+   ============================================================= */
+.badge.grade-safe {
+    background: rgba(16, 185, 129, 0.12);
+    color: var(--color-success);
+    border: 1px solid var(--color-success);
+}
+.badge.grade-warning {
+    background: rgba(245, 158, 11, 0.12);
+    color: var(--color-warning);
+    border: 1px solid var(--color-warning);
+}
+.badge.grade-danger {
+    background: rgba(239, 68, 68, 0.12);
+    color: var(--color-danger);
+    border: 1px solid var(--color-danger);
+}
+
+/* =============================================================
+   세션 진행 상태 파일 표시줄 (State Portability)
+   ============================================================= */
+.session-file-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    max-width: 46%;
+    min-width: 0;
+}
+.session-file-icon { font-size: 15px; flex-shrink: 0; }
+.session-file-meta {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    flex: 1;
+}
+.session-file-name {
+    font-size: 12.5px;
+    font-weight: 700;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.session-file-path {
+    font-family: 'Courier New', monospace;
+    font-size: 10.5px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* =============================================================
+   3단계 검증 대상 선택 모달 — 듀얼 패널 (Transfer List)
+   ============================================================= */
+.modal-xl {
+    max-width: 1020px;
+    width: 94%;
+}
+.transfer-container {
+    display: flex;
+    gap: 10px;
+    align-items: stretch;
+    margin-top: 14px;
+}
+.transfer-panel {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    background: rgba(0, 0, 0, 0.18);
+    overflow: hidden;
+}
+.transfer-panel-selected {
+    border-color: rgba(99, 102, 241, 0.45);
+    background: rgba(99, 102, 241, 0.06);
+}
+.transfer-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.03);
+}
+.transfer-arrows {
+    align-self: center;
+    color: var(--text-muted);
+    font-size: 22px;
+    flex-shrink: 0;
+    padding: 0 2px;
+}
+.transfer-list {
+    list-style: none;
+    margin: 0;
+    padding: 8px;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 300px;
+    max-height: 46vh;
+}
+.transfer-item {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 10px 34px 10px 12px;
+    margin-bottom: 6px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    background: rgba(255, 255, 255, 0.03);
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, transform 0.1s;
+    user-select: none;
+}
+.transfer-item:hover {
+    background: rgba(99, 102, 241, 0.12);
+    border-color: rgba(99, 102, 241, 0.5);
+    transform: translateX(2px);
+}
+.transfer-item-selected {
+    border-color: rgba(99, 102, 241, 0.4);
+    background: rgba(99, 102, 241, 0.08);
+}
+.transfer-item .ti-main {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+}
+.transfer-item .ti-name {
+    font-size: 13.5px;
+    font-weight: 700;
+    color: var(--text-primary);
+    white-space: nowrap;
+}
+.transfer-item .ti-book {
+    font-size: 12px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.transfer-item .ti-badges {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+.transfer-item .ti-score {
+    font-size: 11px;
+    color: var(--text-secondary);
+    background: rgba(255, 255, 255, 0.06);
+    padding: 2px 7px;
+    border-radius: 6px;
+    white-space: nowrap;
+}
+.transfer-item .ti-signals {
+    font-size: 11px;
+    color: var(--color-warning);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.transfer-item .ti-signals-none {
+    color: var(--text-muted);
+}
+.transfer-item .ti-toggle-icon {
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text-muted);
+}
+.transfer-item:hover .ti-toggle-icon {
+    color: var(--text-primary);
+}
+.transfer-empty {
+    padding: 30px 14px;
+    text-align: center;
+    font-size: 12.5px;
+    color: var(--text-muted);
+    line-height: 1.7;
+}
+.stage3-footer-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 18px;
+    flex-wrap: wrap;
+}
+.stage3-select-summary {
+    font-size: 12.5px;
+    color: var(--text-muted);
+}
+.stage3-footer-buttons {
+    display: flex;
+    gap: 10px;
+}

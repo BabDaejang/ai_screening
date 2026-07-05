@@ -3,14 +3,21 @@
 # 교사가 필요에 따라 편집 가능합니다.
 # ============================================================
 
-# 1단계 규칙 검사 가중치 (합계 100 권장)
+# 1단계 규칙 검사 가중치 (가중 평균으로 정규화되므로 합계는 자유)
 weights:
   special_chars: 15        # 특수문자 밀도
   markdown_remnants: 20    # 마크다운 잔재
   chatbot_phrases: 20      # 챗봇 상투구
   paste_artifacts: 15      # 복붙 절단 흔적
-  structural_homogeneity: 15  # 구조 균질성
+  structural_homogeneity: 15  # 구조 균질성 (문단 단위)
+  sentence_variance: 10    # 문장 길이 분산 (문장 단위 균일성)
+  lexical_diversity: 10    # 어휘 다양성 (MATTR — 비정상적으로 높으면 의심)
   metadata_anomaly: 15     # 메타데이터 이상 (docx만)
+
+# 1단계 위험도 등급 임계값 (rule_score 기준, UI 배지 표시용)
+stage1_grade:
+  warning_threshold: 20    # 이 이상이면 Warning(주의)
+  danger_threshold: 45     # 이 이상이면 Danger(위험)
 
 # 각 항목별 세부 설정
 rules:
@@ -48,6 +55,20 @@ rules:
     # 최소 문단 수 (이 미만이면 검사 건너뜀)
     min_paragraphs: 4
 
+  sentence_variance:
+    # 문장 길이 변동계수 임계값 (이 미만이면 기계적 균일성 의심)
+    cv_threshold: 0.35
+    # 최소 문장 수 (이 미만이면 검사 건너뜀)
+    min_sentences: 8
+
+  lexical_diversity:
+    # MATTR 임계값 (이 초과이면 어휘 다양성 과잉 → AI 의심)
+    mattr_threshold: 0.90
+    # 슬라이딩 윈도우 크기 (어절 수)
+    window: 100
+    # 최소 토큰(어절) 수 (이 미만이면 검사 건너뜀)
+    min_tokens: 80
+
   metadata:
     # 1,000자당 최소 편집 시간 (분)
     min_edit_time_per_1000_chars: 5
@@ -68,6 +89,11 @@ cliche_phrases:
   - "시사하는 바가 크다"
   - "단순한"
   - "을 넘어"
+  - "다음과 같습니다"
+  - "통찰을 제공"
+  - "깊은 울림"
+  - "독자로 하여금"
+  - "귀중한 교훈"
 
 # 등급 산정
 tier:
