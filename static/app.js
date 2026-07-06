@@ -4,7 +4,7 @@
 let currentProfile = null;
 let availableModels = {};
 let currentResults = [];
-let progressInterval = null;
+let pollTimer = null; // 상태 적응형 폴링 타이머 (setTimeout 핸들 — 고정 setInterval 사용 금지)
 let selectedFiles = [];
 
 // 폴더 브라우저 상태
@@ -123,8 +123,10 @@ document.addEventListener("DOMContentLoaded", () => {
     // 3단계 선택 상태 (백엔드 awaiting_stage3_selection 페이로드 기반)
     let stage3Candidates = [];          // 전체 후보 (이전 단계 결과 요약 포함)
     let stage3SelectedSet = new Set();  // 우측 패널(검증 대상)에 있는 학생 키
-    let stage3ModalAutoOpened = false;  // 대기 상태 진입 시 1회 자동 오픈 플래그
-    let lastPipelineStatus = "";        // btnNextPhase 클릭 분기용
+    let stage3ModalAutoOpened = false;   // 대기 상태 진입 시 1회 자동 오픈 플래그
+    let lastPipelineStatus = "";         // btnNextPhase 클릭 분기용
+    let prefetchModalAutoOpened = false; // Phase 1.5 사전 생성 승인 모달 1회 자동 오픈 플래그
+    let lastGeneratingActive = false;    // 팩트시트 생성 활성 → 비활성 전환 감지용 (인벤토리 Event-Driven 갱신)
 
     // 세션 진행 상태 파일 UI (State Portability)
     const sessionFileName = document.getElementById("sessionFileName");
@@ -229,6 +231,7 @@ document.addEventListener("DOMContentLoaded", () => {
             } catch (err) {
                 console.error("일시정지/재개 요청 에러:", err);
             }
+            wakePolling(); // Event-Driven: 클릭 직후 즉시 상태 반영
         });
     }
 
@@ -244,6 +247,7 @@ document.addEventListener("DOMContentLoaded", () => {
             } catch (err) {
                 console.error("강제 종료 요청 에러:", err);
             }
+            wakePolling(); // Event-Driven: 클릭 직후 즉시 상태 반영
         });
     }
 
@@ -880,9 +884,9 @@ document.addEventListener("DOMContentLoaded", () => {
                     `;
                 }
 
-                if (progressInterval) clearInterval(progressInterval);
-                pollProgress(); // 즉시 한 번 호출하여 2초 대기 딜레이 없이 상태 표시
-                progressInterval = setInterval(pollProgress, 2000);
+                // 즉시 1회 호출 — 이후에는 pollProgress가 파이프라인 상태에 따라
+                // 스스로 다음 폴링을 예약한다 (활성 작업 2초 / 대기 keep-alive 60초 / 종료 시 파괴).
+                wakePolling();
             } else {
                 const data = await res.json();
                 alert(`분석 시작 실패: ${data.detail}`);
@@ -928,7 +932,39 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    // -------------------------------------------------------------
+    // [Zero-Idle Polling] 상태 적응형 폴링 스케줄러
+    // - 활성 작업(파이프라인 running/paused, 팩트시트 생성 중)일 때만 2초 주기.
+    // - 대기 상태(awaiting_phase / awaiting_stage3_selection)에서는 60초 keep-alive만
+    //   유지하며, 이때 호출하는 /api/analyze/status는 서버 인메모리 스냅샷 반환뿐
+    //   (파일 읽기 등 서버 I/O 0). 상태 전환은 사용자 버튼 클릭(wakePolling)이
+    //   즉시 반영하므로 대기 중 잦은 폴링이 필요 없다 (Event-Driven).
+    // - 파이프라인 종료(completed/error/stopped/idle) 시 타이머를 즉시 파괴한다.
+    // -------------------------------------------------------------
+    const POLL_FAST_MS = 2000;
+    const POLL_KEEPALIVE_MS = 60000;
+
+    function stopPolling() {
+        if (pollTimer) {
+            clearTimeout(pollTimer);
+            pollTimer = null;
+        }
+    }
+
+    function schedulePoll(delayMs) {
+        stopPolling();
+        pollTimer = setTimeout(pollProgress, delayMs);
+    }
+
+    // 사용자 클릭 등 명시적 이벤트 직후 즉시 1회 상태를 갱신한다.
+    // (keep-alive 60초를 기다리지 않고 UI가 곧바로 반응하도록 하는 Event-Driven 훅)
+    function wakePolling() {
+        stopPolling();
+        pollProgress();
+    }
+
     async function pollProgress() {
+        let nextDelay = null; // null이면 폴링 종료 (타이머 파괴 상태 유지)
         try {
             const res = await fetch("/api/analyze/status");
             const state = await res.json();
@@ -936,6 +972,12 @@ document.addEventListener("DOMContentLoaded", () => {
             // 백엔드 상태에 따른 중앙 프레임 조건부 전환
             switchFrameState(state.status);
             lastPipelineStatus = state.status;
+
+            // 활성 작업 판정: LLM/무거운 연산이 실제로 돌고 있는 상태에서만 빠른 폴링 유지
+            const isActiveWork = state.status === "running" || state.status === "paused";
+            const generatingNow = Boolean(state.factsheet_generating)
+                || Boolean(state.prefetch && state.prefetch.current);
+            const isWaitingGate = state.status === "awaiting_phase" || state.status === "awaiting_stage3_selection";
 
             // 3단계 대상 선택 대기 상태: 듀얼 패널 모달 초기화 및 1회 자동 오픈
             if (state.status === "awaiting_stage3_selection" && state.stage3_selection) {
@@ -948,6 +990,31 @@ document.addEventListener("DOMContentLoaded", () => {
                 stage3ModalAutoOpened = false;
                 if (modalStage3Select && modalStage3Select.style.display !== "none" && state.status !== "awaiting_stage3_selection") {
                     modalStage3Select.style.display = "none"; // 확정/종료 후 잔여 모달 정리
+                }
+            }
+
+            // [Token Control] Phase 1.5 사전 생성 '사용자 승인' 모달:
+            // 1단계 완료 대기 상태에서 캐시 누락 도서가 있으면 1회 자동 오픈.
+            // [예] 클릭 전까지 백엔드는 어떤 LLM도 호출하지 않는다.
+            const modalPrefetchConsent = document.getElementById("modalPrefetchConsent");
+            if (state.status === "awaiting_phase" && state.prefetch_offer) {
+                if (!prefetchModalAutoOpened && modalPrefetchConsent) {
+                    const offer = state.prefetch_offer;
+                    const textEl = document.getElementById("prefetchConsentText");
+                    if (textEl) {
+                        textEl.innerHTML =
+                            `현재 팩트시트가 누락된 도서가 총 <strong>${offer.missing_total}권</strong> 있습니다.<br>` +
+                            `다음 단계의 빠른 처리를 위해 약 10%(<strong>${offer.sample_size}권</strong>)의 팩트시트를 미리 생성하시겠습니까?<br>` +
+                            `<span style="color: var(--text-muted); font-size: 12.5px;">(예상 소요 토큰: 약 ${Number(offer.estimated_tokens).toLocaleString()} 토큰 / ` +
+                            `승인 전까지 LLM 호출·토큰 소모 0 — 건너뛰면 검증 시점에 1권 단위로 생성됩니다)</span>`;
+                    }
+                    modalPrefetchConsent.style.display = "flex";
+                    prefetchModalAutoOpened = true;
+                }
+            } else {
+                prefetchModalAutoOpened = false;
+                if (modalPrefetchConsent && modalPrefetchConsent.style.display !== "none") {
+                    modalPrefetchConsent.style.display = "none"; // 결정/단계 전환 후 잔여 모달 정리
                 }
             }
 
@@ -966,10 +1033,33 @@ document.addEventListener("DOMContentLoaded", () => {
                     centerFrameDetail.textContent = cleanLog;
                 }
 
-                // [선별 결과 목록] 실시간 반영: 완료된 학생이 생길 때마다 즉시 테이블에 노출
-                await refreshLiveResults();
-                // Task 2: 새로 생성된 팩트시트가 있을 수 있으므로 도서 인벤토리도 함께 갱신
-                await fetchBookInventory();
+                // [JIT 팩트시트 스피너] Cache Miss로 도서 1권을 신규 생성 중이면
+                // "'{도서명}' 팩트시트 신규 생성 중..." 배너를 표시하여 시스템이
+                // 다운된 것이 아님을 사용자에게 인지시킨다 (백엔드 factsheet_generating 플래그 연동).
+                const factsheetGenBanner = document.getElementById("factsheetGenBanner");
+                const factsheetGenText = document.getElementById("factsheetGenText");
+                if (factsheetGenBanner && factsheetGenText) {
+                    if (state.factsheet_generating) {
+                        factsheetGenText.textContent = `'${state.factsheet_generating}' 팩트시트 신규 생성 중... (LLM 호출 — 시스템이 멈춘 것이 아닙니다)`;
+                        factsheetGenBanner.style.display = "flex";
+                    } else {
+                        factsheetGenBanner.style.display = "none";
+                    }
+                }
+
+                // [Guard — Zero-Idle Polling] 서버 부하가 있는 부가 조회는 '활성 작업 중'에만 수행:
+                // - /api/results (인메모리): 학생 처리 결과가 실제로 갱신되는 동안만 재조회.
+                // - /api/book-inventory (book_cache.json 파일 재파싱): 주기 타이머를 완전히 제거하고,
+                //   팩트시트 생성이 '활성 → 비활성'으로 전환되는 순간에만 1회 갱신(Event-Driven).
+                // 대기 상태(awaiting_*)의 60초 keep-alive 턴에서는 이 블록이 전부 생략되어
+                // /api/analyze/status(메모리 스냅샷) 단일 호출 외 어떤 서버 I/O도 발생하지 않는다.
+                if (isActiveWork || generatingNow) {
+                    await refreshLiveResults();
+                }
+                if (lastGeneratingActive && !generatingNow) {
+                    await fetchBookInventory(); // 생성 종료 시점 1회 (신규 팩트시트 반영)
+                }
+                lastGeneratingActive = generatingNow;
             }
 
             // Task 5: 단계 게이트/3단계 대상 선택 대기 상태에서만 게이팅 버튼 활성화
@@ -1018,7 +1108,7 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             if (state.status === "completed") {
-                clearInterval(progressInterval);
+                stopPolling();
                 btnStartAnalyze.disabled = false;
                 switchFrameState("idle");
                 await fetchLastResults();
@@ -1026,7 +1116,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 await fetchSessionInfo(); // 완료 시점의 세션 스냅샷 저장 정보 갱신
                 alert("선별 분석 작업이 완료되었습니다!");
             } else if (state.status === "error") {
-                clearInterval(progressInterval);
+                stopPolling();
                 btnStartAnalyze.disabled = false;
                 
                 // [에러 발생 상태] 전환 및 메시지 설정
@@ -1036,14 +1126,30 @@ document.addEventListener("DOMContentLoaded", () => {
                 }
                 switchFrameState("error");
             } else if (state.status === "stopped") {
-                clearInterval(progressInterval);
+                stopPolling();
                 btnStartAnalyze.disabled = false;
                 switchFrameState("idle");
                 alert("분석 작업이 강제 종료되었습니다.");
             }
 
+            // [Zero-Idle Polling 스케줄러] 이번 턴의 상태를 기준으로 다음 폴링을 결정한다.
+            // 종료 상태면 nextDelay=null 그대로 두어 타이머를 완전히 파괴한다.
+            if (isActiveWork || generatingNow) {
+                nextDelay = POLL_FAST_MS;       // 실제 작업/생성 중에만 빠른 갱신
+            } else if (isWaitingGate) {
+                nextDelay = POLL_KEEPALIVE_MS;  // 대기 상태: 60초 메모리 핑 keep-alive만
+            }
+
         } catch (err) {
             console.error("상태 폴링 오류:", err);
+            // 통신 실패 시에도 빠른 재시도로 서버를 두드리지 않고 keep-alive 주기로만 재시도
+            nextDelay = POLL_KEEPALIVE_MS;
+        }
+
+        if (nextDelay !== null) {
+            schedulePoll(nextDelay);
+        } else {
+            stopPolling();
         }
     }
 
@@ -1246,6 +1352,47 @@ document.addEventListener("DOMContentLoaded", () => {
             } catch (err) {
                 console.error("다음 단계 진행 API 에러:", err);
             }
+            wakePolling(); // Event-Driven: 클릭 직후 즉시 상태 반영 (keep-alive 60초를 기다리지 않음)
+        });
+    }
+
+    // -------------------------------------------------------------
+    // Phase 1.5 사전 생성 '사용자 승인' 모달 (Token Control)
+    // 사전 생성(LLM 토큰 소모)은 아래 [예] 버튼의 onClick 핸들러에서만 발화된다.
+    // -------------------------------------------------------------
+    async function sendPrefetchDecision(accept) {
+        const modal = document.getElementById("modalPrefetchConsent");
+        try {
+            const res = await fetch("/api/analyze/prefetch-decision", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ accept })
+            });
+            if (!res.ok) {
+                const errData = await res.json();
+                alert(`요청 실패: ${errData.detail || "알 수 없는 오류"}`);
+            }
+        } catch (err) {
+            console.error("사전 생성 승인 API 에러:", err);
+        }
+        if (modal) modal.style.display = "none";
+        wakePolling(); // 승인 시 진행 상황(2초 폴링) 전환 / 거절 시 keep-alive 유지 판정을 즉시 반영
+    }
+
+    const btnPrefetchAccept = document.getElementById("btnPrefetchAccept");
+    const btnPrefetchDecline = document.getElementById("btnPrefetchDecline");
+    const btnClosePrefetchModal = document.getElementById("btnClosePrefetchModal");
+    if (btnPrefetchAccept) {
+        btnPrefetchAccept.addEventListener("click", () => sendPrefetchDecision(true));
+    }
+    if (btnPrefetchDecline) {
+        btnPrefetchDecline.addEventListener("click", () => sendPrefetchDecision(false));
+    }
+    if (btnClosePrefetchModal) {
+        // 닫기(X)는 '보류'일 뿐 — 결정 전까지 백엔드는 계속 대기하며 토큰 소모 0.
+        btnClosePrefetchModal.addEventListener("click", () => {
+            const modal = document.getElementById("modalPrefetchConsent");
+            if (modal) modal.style.display = "none";
         });
     }
 
@@ -1377,6 +1524,7 @@ document.addEventListener("DOMContentLoaded", () => {
             });
             if (res.ok) {
                 modalStage3Select.style.display = "none";
+                wakePolling(); // Event-Driven: 확정 직후 즉시 3단계 진행 상태(2초 폴링)로 전환
             } else {
                 const errData = await res.json();
                 alert(`검증 대상 확정 실패: ${errData.detail || "알 수 없는 오류"}`);

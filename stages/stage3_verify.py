@@ -295,6 +295,7 @@ def run_stage3(
     no_web: bool,
     check_cb = None,
     on_item_done = None,
+    ensure_cb = None,
 ) -> list[dict]:
     """3단계 사실 검증을 실행한다.
 
@@ -302,6 +303,12 @@ def run_stage3(
     상위 레이어(원자적 영속화/실시간 UI 반영)가 즉시 반응할 수 있도록 한다. 각 candidate는
     독립된 API 호출로 검증되며, 직전 학생의 판정 결과나 대화 맥락을 이어받지 않는다
     (Stateless per-student — 할루시네이션 전이 차단).
+
+    ensure_cb(book_title) -> str | None:
+        Just-In-Time 팩트시트 확보 훅. 지정 시 검증 루프가 각 도서를 '만나는 시점'에
+        이 콜백으로 팩트시트를 확보한다 (상위 레이어가 book_cache.json Cache Hit/Miss
+        판정, Miss 시 해당 1권만 LLM 생성 + UI 스피너 표시를 담당). 미지정 시 기존
+        파일 캐시 기반 ensure_factsheet로 폴백한다.
     """
     # 책 제목별로 그룹핑 (캐시 효율성)
     book_groups: dict[str, list[int]] = defaultdict(list)
@@ -319,9 +326,13 @@ def run_stage3(
     last_error_msg = ""
 
     for book_title, indices in book_groups.items():
-        # 팩트시트 확보
+        # 팩트시트 확보 — 도서가 검증 루프에 '등장하는 시점'에만 수행 (Just-In-Time).
+        # ensure_cb가 있으면 상위 레이어의 book_cache.json 기반 Cache Hit/Miss 로직 사용.
         try:
-            factsheet = ensure_factsheet(book_title, provider, factsheets_dir, no_web)
+            if ensure_cb is not None:
+                factsheet = ensure_cb(book_title)
+            else:
+                factsheet = ensure_factsheet(book_title, provider, factsheets_dir, no_web)
         except Exception as exc:
             factsheet = None
             logger.error("[3단계] 팩트시트 확보 중 예외 발생: %s", exc)

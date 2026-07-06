@@ -6,7 +6,9 @@ import csv
 import io
 import json
 import logging
+import math
 import os
+import random
 import re
 import threading
 import time
@@ -52,10 +54,22 @@ analysis_state = {
     "error_message": "",
     "awaiting_phase": None,  # None | "phase2" | "phase3" — [다음 단계 진행] 버튼 게이팅용
     "stage3_selection": None,  # awaiting_stage3_selection 상태에서 듀얼 패널 모달용 후보 페이로드
+    # JIT 팩트시트(Cache Miss) 생성 중인 도서명 — UI 로딩 스피너 "'{도서명}' 팩트시트 신규 생성 중..." 표시용
+    "factsheet_generating": None,
+    # Phase 1.5(마이크로 배치 선제 생성) 진행 정보: {"total": n, "done": k, "current": 도서명|None}
+    "prefetch": None,
+    # Phase 1.5 사전 생성 '사용자 승인 제안' 페이로드 (Token Control):
+    # {"missing_total": X, "sample_size": Y, "estimated_tokens": n} | None
+    # 사용자가 [예, 사전 작업 진행]을 명시적으로 클릭하기 전까지 LLM은 절대 호출되지 않는다.
+    "prefetch_offer": None,
 }
 
 # 락 객체 및 실행 제어 이벤트
 state_lock = threading.Lock()
+# book_cache.json 공유 딕셔너리/파일 보호용 락:
+# Phase 1.5 백그라운드 선제 생성 스레드와 메인 파이프라인(JIT 생성),
+# 온디맨드 보강(enrich) 엔드포인트가 동시에 load-modify-save 하는 것을 직렬화한다.
+book_cache_lock = threading.Lock()
 stop_event = threading.Event()
 pause_event = threading.Event()
 pause_event.set()
@@ -64,6 +78,12 @@ phase_gate_event = threading.Event()
 # 3단계 사용자 주도형 대상 선택 게이트 (듀얼 패널 모달의 [최종 검증 확정]이 해제)
 stage3_selection_event = threading.Event()
 stage3_selected = {"keys": None}  # 사용자가 확정한 학생 키 목록
+
+# Phase 1.5 사전 생성 잡 홀더 (Token Control — 명시적 사용자 동의 게이트):
+# 파이프라인은 실행 준비된 클로저만 "run"에 적재하고 스레드를 절대 스스로 기동하지 않는다.
+# 스레드 기동(=LLM 호출 개시)은 오직 POST /api/analyze/prefetch-decision(accept=true)
+# 엔드포인트, 즉 사용자의 [예, 사전 작업 진행] onClick 이벤트 핸들러에서만 발생한다.
+prefetch_job = {"run": None, "thread": None}
 
 # 단계별 명칭 (Task 5 게이팅 UI에 표시)
 _PHASE_LABELS = {
@@ -85,6 +105,11 @@ def wait_for_phase_gate(phase_key: str):
         analysis_state["step"] = f"[대기] {phase_label} 진입 대기 중 — [다음 단계 진행] 버튼을 클릭하세요."
     add_log(f"⏸️ {phase_label} 진입 대기 중입니다. [다음 단계 진행] 버튼을 클릭해 주세요.")
 
+    # [Guard — Idle State Security] 이 대기 루프는 threading.Event 상태 확인만 반복하는
+    # 순수 이벤트 대기다. LLM API 호출·파일 IO·무거운 연산이 전혀 없으므로, 대기 상태
+    # (phase_status == 'awaiting_phase')에서는 UI 폴링/리렌더링과 무관하게 토큰 소모 0이
+    # 보장된다. 게이트 해제(phase_gate_event.set)는 오직 사용자의 [다음 단계 진행] 버튼
+    # onClick → POST /api/analyze/next-phase 이벤트 핸들러에서만 발생한다 (Trigger Isolation).
     while not phase_gate_event.is_set():
         if stop_event.is_set():
             raise Exception("사용자에 의해 분석이 강제 종료되었습니다.")
@@ -369,32 +394,48 @@ def ensure_book_factsheet_cached(
     factsheets_dir: str,
     no_web: bool,
 ) -> str:
-    """도서 1권의 팩트시트를 확보한다 (CASE A: 캐시 재사용 / CASE B: 신규 생성 후 Write-Through).
+    """도서 1권의 팩트시트를 확보한다 (CASE A: Cache Hit 재사용 / CASE B: Cache Miss → JIT 생성 후 Write-Through).
 
-    book_cache.json 및 factsheets/*.md 로컬 파일에 즉시 flush+fsync 기록하며,
-    Phase 2 진입 시의 배치 선제 생성과 Phase 3의 개별 검증 단계에서 공통으로 재사용된다.
+    - Cache Hit: book_cache.json의 로컬 팩트시트를 즉시 반환 (LLM 호출·토큰 소모 0).
+    - Cache Miss: '그 시점에 해당 도서 1권에 대해서만' LLM을 호출해 생성하고 즉시
+      book_cache.json에 Append(Write-Through: flush+fsync)한다. 생성 중에는
+      analysis_state["factsheet_generating"]에 도서명을 세팅하여 UI가
+      "'{도서명}' 팩트시트 신규 생성 중..." 스피너를 표시하도록 한다.
+    Phase 1.5(마이크로 배치 선제 생성)와 Phase 2(JIT 검증)에서 공통으로 재사용된다.
     """
     cache_key = normalize_cache_key(book_title, author)
 
-    if cache_key in book_cache:
+    with book_cache_lock:
+        cached_entry = book_cache.get(cache_key)
+
+    if cached_entry is not None:
         add_log(f"💾 캐시 히트! '{cache_key}' 도서 정보를 book_cache.json에서 불러옵니다. (토큰 0)")
-        factsheet_content = book_cache[cache_key].get("factsheet", "")
+        factsheet_content = cached_entry.get("factsheet", "")
     else:
         if no_web:
             add_log(f"🌐 캐시 미스했으나 no_web 옵션 활성화 상태로 생략: {cache_key}")
             return ""
 
-        add_log(f"🌐 캐시 미스! '{cache_key}' 도서의 팩트시트를 생성합니다. (웹 검색/LLM 가동)")
-        factsheet_content = provider_verify.generate_factsheet(book_title)
+        # Cache Miss: 해당 도서 1권만 JIT 생성. UI 스피너 플래그를 세팅해
+        # 사용자에게 시스템이 다운된 것이 아님을 인지시킨다 (finally에서 반드시 해제).
+        with state_lock:
+            analysis_state["factsheet_generating"] = book_title
+        add_log(f"🌐 캐시 미스! '{book_title}' 팩트시트 신규 생성 중... (해당 1권만 LLM 호출)")
+        try:
+            factsheet_content = provider_verify.generate_factsheet(book_title)
+        finally:
+            with state_lock:
+                analysis_state["factsheet_generating"] = None
 
-        book_cache[cache_key] = {
-            "book_title": book_title,
-            "author": author,
-            "factsheet": factsheet_content,
-            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        save_book_cache(book_cache)
-        add_log(f"💾 '{cache_key}' 도서 정보를 book_cache.json에 저장 완료.")
+        with book_cache_lock:
+            book_cache[cache_key] = {
+                "book_title": book_title,
+                "author": author,
+                "factsheet": factsheet_content,
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            save_book_cache(book_cache)
+        add_log(f"💾 '{cache_key}' 도서 정보를 book_cache.json에 저장 완료 (즉시 Append).")
 
     if factsheet_content:
         normalized_title = _normalize_title(book_title)
@@ -963,65 +1004,115 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                 with state_lock:
                     analysis_state["results"] = resumed_results + list(new_results)
 
-            # Task 3/5: 1단계(토큰 비소비, 로컬 규칙 기반)가 전수 완료된 뒤에만 게이트가 열린다.
-            # 사용자가 [다음 단계 진행]을 클릭하기 전까지는 토큰을 소비하는 2단계로 절대 진입하지 않는다.
-            wait_for_phase_gate("phase2")
-
-            # book_cache / factsheets_dir / book_author_map은 아래 배치 선제 생성과
-            # 3단계의 개별 팩트시트 확보 로직이 공유하는 상태이므로 여기서 한 번만 초기화한다.
+            # book_cache / factsheets_dir / book_author_map은 Phase 1.5 마이크로 배치 선제
+            # 생성 스레드와 3단계 JIT 팩트시트 확보 로직이 공유하는 상태이므로 한 번만 초기화한다.
             factsheets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "factsheets")
             os.makedirs(factsheets_dir, exist_ok=True)
             book_cache = load_book_cache()
             book_author_map: dict[str, str] = {}
 
+            def _resolve_author(book_title: str, provider) -> str:
+                """도서 저자 확보 (우선순위: 세션 메모 → 1단계 '도서명(저자)' 파싱값
+                → book_cache 도서명 일치 폴백 → 최후에만 LLM 역추적).
+                Phase 1.5 선제 생성과 Phase 2 JIT 생성이 공통으로 사용한다."""
+                if book_title in book_author_map:
+                    return book_author_map[book_title]
+                author = next(
+                    (r.get("author") for r in new_results
+                     if r.get("book_title") == book_title and r.get("author")),
+                    None,
+                )
+                if not author:
+                    # Title-first 캐시 폴백: 저자 미상이라도 도서명 정규화 일치로 기존
+                    # 캐시 엔트리를 먼저 탐색 → 캐시 히트 시 역추적 LLM 호출 완전 생략.
+                    with book_cache_lock:
+                        cached_hit = find_cached_book_entry_by_title(book_title, book_cache)
+                    if cached_hit:
+                        author = cached_hit[1].get("author") or "Unknown"
+                        add_log(f"💾 캐시 재사용: '{book_title}' 저자('{author}') 복원 — 역추적 LLM 호출 생략 (토큰 0)")
+                    else:
+                        add_log(f"🔍 '{book_title}' 도서의 저자 정보 누락 감지. 저자 역추적 중...")
+                        author = lookup_author(book_title, provider)
+                book_author_map[book_title] = author
+                return author
+
             # -----------------------------------------------------------------
-            # 2단계 진입 즉시: analysis_state["results"]에 이미 확보된 고유 도서명을
-            # 추출하여 팩트시트를 최우선 배치 생성한다 (학생별 스크리닝 루프 진입 전).
-            # book_cache.json / factsheets/*.md에 즉시 flush+fsync로 write-through된다.
+            # Step B (Phase 1.5 — Micro-Batch Pre-computation, Opt-In)
+            # 1단계 완료 직후, 고유 도서(Unique Books) 중 book_cache.json에 없는
+            # 캐시 미스분만 추려 '무작위 약 10% (최소 1~2권)' 샘플을 준비한다.
+            # [Token Control] 여기서는 어떤 LLM 호출도 하지 않는다. 실행 준비된
+            # 클로저를 prefetch_job["run"]에 적재하고 UI에 승인 제안(prefetch_offer)만
+            # 게시할 뿐이며, 실제 생성(토큰 소모)은 사용자가 [예, 사전 작업 진행]
+            # 버튼을 클릭(POST /api/analyze/prefetch-decision)했을 때만 시작된다.
+            # [아니오]를 누르거나 무시하면 사전 작업 없이 대기 상태가 유지되고,
+            # 누락 도서는 전부 검증 시점 JIT 생성으로 처리된다.
             # -----------------------------------------------------------------
+            prefetch_job["run"] = None
+            prefetch_job["thread"] = None
             if not req.no_verify:
                 unique_titles = sorted({r["book_title"] for r in new_results if r.get("book_title")})
-                if unique_titles:
-                    add_log(f"📚 2단계 진입과 동시에 고유 도서 {len(unique_titles)}종의 팩트시트를 선제 생성합니다.")
-                    provider_verify_prefetch = create_provider(
-                        provider_name=req.verify_provider,
-                        api_key=verify_key,
-                        model_screening="",  # 사용되지 않음
-                        model_verify=req.verify_model,
-                        cost_tracker=cost_tracker
+                with book_cache_lock:
+                    missing_titles = [
+                        t for t in unique_titles
+                        if not find_cached_book_entry_by_title(t, book_cache)
+                    ]
+                cached_count = len(unique_titles) - len(missing_titles)
+
+                if missing_titles:
+                    sample_size = min(len(missing_titles), max(2, math.ceil(len(missing_titles) * 0.10)))
+                    sampled_titles = random.sample(missing_titles, sample_size)
+                    # 도서 1권당 평균 토큰 추정치: 팩트시트 생성 입력 ~500 + 출력 ~1500
+                    # (stages/stage3_verify.py estimate_cost의 추정 상수와 동일 기준)
+                    estimated_tokens = sample_size * 2000
+
+                    def _prefetch_micro_batch():
+                        # 사용자 승인 후에만 이 스레드가 기동된다. provider 생성도
+                        # 승인 이전에는 수행하지 않도록 클로저 내부로 지연시켰다.
+                        provider_prefetch = create_provider(
+                            provider_name=req.verify_provider,
+                            api_key=verify_key,
+                            model_screening="",  # 사용되지 않음
+                            model_verify=req.verify_model,
+                            cost_tracker=cost_tracker
+                        )
+                        done = 0
+                        for title in sampled_titles:
+                            if stop_event.is_set():
+                                break
+                            with state_lock:
+                                analysis_state["prefetch"] = {"total": sample_size, "done": done, "current": title}
+                            try:
+                                author = _resolve_author(title, provider_prefetch)
+                                ensure_book_factsheet_cached(
+                                    title, author, provider_prefetch,
+                                    book_cache, factsheets_dir, req.no_web,
+                                )
+                            except Exception as ex:
+                                logger.error(f"[Phase 1.5 선제생성] 도서 '{title}' 실패 (계속 진행): {ex}")
+                            done += 1
+                        with state_lock:
+                            analysis_state["prefetch"] = {"total": sample_size, "done": done, "current": None}
+                        add_log(f"📚 [Phase 1.5] 마이크로 배치 선제 생성 완료 ({done}/{sample_size}권).")
+
+                    prefetch_job["run"] = _prefetch_micro_batch
+                    with state_lock:
+                        analysis_state["prefetch_offer"] = {
+                            "missing_total": len(missing_titles),
+                            "sample_size": sample_size,
+                            "estimated_tokens": estimated_tokens,
+                        }
+                    add_log(
+                        f"📚 [Phase 1.5] 팩트시트 누락 도서 {len(missing_titles)}권 감지 (전체 고유 도서 {len(unique_titles)}종 중 캐시 보유 {cached_count}종). "
+                        f"무작위 {sample_size}권 사전 생성 여부를 묻는 승인 창을 표시합니다 — 사용자가 [예]를 누르기 전까지 토큰 소모 0."
                     )
-                    for book_title in unique_titles:
-                        try:
-                            # '도서명(저자명)' 파싱으로 이미 저자가 확보된 경우 재사용하여
-                            # 불필요한 저자 역추적 LLM 호출을 생략한다 (토큰 절약).
-                            pre_extracted_author = next(
-                                (r.get("author") for r in new_results
-                                 if r.get("book_title") == book_title and r.get("author")),
-                                None,
-                            )
-                            if pre_extracted_author:
-                                author = pre_extracted_author
-                            else:
-                                # Title-first 캐시 폴백: 저자 미상이라도 도서명 정규화 일치로
-                                # 기존 캐시 엔트리를 먼저 탐색하여, 캐시 히트 시 저자 역추적
-                                # LLM 호출까지 완전히 생략한다 (Cache Hit → 토큰 소모 0).
-                                cached_hit = find_cached_book_entry_by_title(book_title, book_cache)
-                                if cached_hit:
-                                    author = cached_hit[1].get("author") or "Unknown"
-                                    add_log(
-                                        f"💾 캐시 재사용: '{book_title}' 저자('{author}')를 "
-                                        f"book_cache.json에서 복원 — 저자 역추적 LLM 호출 생략 (토큰 0)"
-                                    )
-                                else:
-                                    author = lookup_author(book_title, provider_verify_prefetch)
-                            book_author_map[book_title] = author
-                            ensure_book_factsheet_cached(
-                                book_title, author, provider_verify_prefetch,
-                                book_cache, factsheets_dir, req.no_web,
-                            )
-                        except Exception as ex:
-                            logger.error(f"[선제생성] 도서 '{book_title}' 팩트시트 준비 중 에러(계속 진행): {ex}")
-                            continue
+                elif unique_titles:
+                    add_log(f"📚 [Phase 1.5] 고유 도서 {len(unique_titles)}종 전부 캐시 보유 — 선제 생성 불필요 (토큰 0).")
+
+            # Step A 정지선(Breakpoint): 1단계(토큰 비소비, 규칙 기반)가 전수 완료되어
+            # 결과 리스트가 전부 렌더링된 뒤 명시적으로 정지한다. 사용자가 [다음 단계 진행]
+            # 버튼을 클릭(POST /api/analyze/next-phase)하기 전까지 이 지점을 절대 통과하지
+            # 않으므로, 즉시 다음 단계로 넘어가는 경로가 원천 차단된다.
+            wait_for_phase_gate("phase2")
 
             # 2단계 AI 스크리닝 (신규 대상만)
             update_progress(45, "2단계: AI 문체 스크리닝 중...")
@@ -1129,50 +1220,45 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                     cost_tracker=cost_tracker
                 )
 
-                # book_cache / factsheets_dir는 2단계 진입 시 이미 초기화·선제생성되어 공유되므로 재사용한다.
-                for cand in candidates:
-                    book_title = None
+                # Phase 1.5 선제 생성(사용자 승인으로 기동된 경우)이 아직 끝나지 않았다면
+                # 완료를 기다린다 (book_cache 동시 쓰기 경합 방지 — 통상 이미 종료됨).
+                prefetch_thread = prefetch_job.get("thread")
+                if prefetch_thread is not None and prefetch_thread.is_alive():
+                    add_log("⏳ [Phase 1.5] 백그라운드 선제 생성 마무리 대기 중...")
+                    while prefetch_thread.is_alive():
+                        if stop_event.is_set():
+                            raise Exception("사용자에 의해 분석이 강제 종료되었습니다.")
+                        prefetch_thread.join(timeout=1.0)
+
+                def _ensure_factsheet_jit(book_title: str) -> Optional[str]:
+                    """Step C (Just-In-Time Evaluation): run_stage3가 검증 도중 해당 도서를
+                    '만나는 시점'에만 호출한다.
+                    - Cache Hit(Phase 1.5 선제 생성분 또는 과거 세션분): 로컬 팩트시트 즉시
+                      반환 → LLM 호출·토큰 소모 0.
+                    - Cache Miss: 그 시점에 해당 도서 1권만 LLM으로 생성하고 즉시
+                      book_cache.json에 Append한 뒤 검증을 이어간다 (생성 중 UI 스피너 표시).
+                    """
                     try:
-                        # 1. 도서명 확보
-                        book_title = cand.get("stage2", {}).get("book_title") or cand.get("book_title")
                         if not book_title or book_title.lower() == "unknown":
-                            continue
-
-                        # 2. 저자명 확보: 2단계 선제생성 시 이미 조회된 값을 최우선 재사용하여
-                        #    캐시 키(cache_key)가 어긋나지 않도록 하고, 중복 저자 역추적을 방지한다.
-                        author = (
-                            book_author_map.get(book_title)
-                            or cand.get("stage2", {}).get("author")
-                            or cand.get("author")
-                        )
-                        if not author or author.strip() == "":
-                            # Title-first 캐시 폴백: 역추적 LLM 호출 전에 도서명만으로
-                            # 기존 캐시 엔트리를 탐색한다 (Cache Hit → 토큰 소모 0).
-                            cached_hit = find_cached_book_entry_by_title(book_title, book_cache)
-                            if cached_hit:
-                                author = cached_hit[1].get("author") or "Unknown"
-                                add_log(f"💾 캐시 재사용: '{book_title}' 저자('{author}') 복원 — 역추적 LLM 호출 생략 (토큰 0)")
-                            else:
-                                add_log(f"🔍 '{book_title}' 도서의 저자 정보 누락 감지. 저자 역추적 중...")
-                                author = lookup_author(book_title, provider_verify)
-                                add_log(f"✅ 저자 추적 완료: '{book_title}' -> '{author}'")
-                            book_author_map[book_title] = author
-
-                        # 데이터 구조에 강제 업데이트하여 데이터 유실 방지
-                        if "stage2" not in cand:
-                            cand["stage2"] = {}
-                        cand["stage2"]["author"] = author
-                        cand["author"] = author
-
-                        # 3~5. Fact Sheet Cache-Look-up(CASE A/B) 및 로컬 파일 Write-Through
-                        ensure_book_factsheet_cached(
+                            return None
+                        author = _resolve_author(book_title, provider_verify)
+                        # 확정된 저자를 같은 도서의 모든 후보 레코드에 반영 (데이터 유실 방지)
+                        for cand in candidates:
+                            cand_title = cand.get("stage2", {}).get("book_title") or cand.get("book_title")
+                            if cand_title == book_title:
+                                if "stage2" not in cand:
+                                    cand["stage2"] = {}
+                                cand["stage2"]["author"] = author
+                                cand["author"] = author
+                        content = ensure_book_factsheet_cached(
                             book_title, author, provider_verify,
                             book_cache, factsheets_dir, req.no_web,
                         )
+                        return content or None
                     except Exception as ex:
-                        # Defensive: 특정 항목 대조 중 에러가 나더라도 continue로 강제 진행
-                        logger.error(f"도서 '{book_title}' 사실검증 캐싱 준비 에러 (루프 계속 진행): {ex}")
-                        continue
+                        # Defensive: 팩트시트 확보 실패 시에도 해당 도서만 '검증 불가' 처리하고 계속 진행
+                        logger.error(f"[JIT] 도서 '{book_title}' 팩트시트 확보 에러 (검증 계속 진행): {ex}")
+                        return None
 
                 def _on_stage3_item_done(cand: dict):
                     """피실험자 1명의 3단계 검증이 끝나는 즉시(Atomic Unit 완료) 최종 결과를 확정하고
@@ -1191,9 +1277,12 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
 
                     _finalize_and_persist_student(cand)
 
+                # ensure_cb=_ensure_factsheet_jit: 팩트시트를 사전 일괄 생성하지 않고,
+                # 검증 루프가 각 도서를 만나는 순간 Cache Hit/Miss를 판정해 JIT 확보한다.
                 run_stage3(
                     candidates, provider_verify, factsheets_dir, config, req.no_web,
                     check_cb=check_control_state, on_item_done=_on_stage3_item_done,
+                    ensure_cb=_ensure_factsheet_jit,
                 )
 
             # 3단계 대상이 아닌 학생은 2단계 완료 및 등급 확정 시점에 이미 Atomic Unit 처리가
@@ -1251,6 +1340,8 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
             analysis_state["step"] = "분석 완료"
             analysis_state["results"] = results
             analysis_state["cost_summary"] = cost_summary
+            analysis_state["prefetch_offer"] = None
+        prefetch_job["run"] = None
 
         # 최종 세션 스냅샷 저장 (State Portability — 타 PC에서 이어하기 가능)
         save_session_progress(results, cost_summary, status="completed")
@@ -1269,6 +1360,8 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                 analysis_state["status"] = "error"
                 analysis_state["error_message"] = str(e)
                 analysis_state["step"] = "에러 발생"
+            analysis_state["prefetch_offer"] = None
+        prefetch_job["run"] = None
         add_log(f"❌ 에러가 발생했습니다: {e}")
 
 @app.post("/api/analyze")
@@ -1294,11 +1387,16 @@ def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks):
         analysis_state["error_message"] = ""
         analysis_state["awaiting_phase"] = None
         analysis_state["stage3_selection"] = None
+        analysis_state["factsheet_generating"] = None
+        analysis_state["prefetch"] = None
+        analysis_state["prefetch_offer"] = None
         stop_event.clear()
         pause_event.set()
         phase_gate_event.clear()
         stage3_selection_event.clear()
         stage3_selected["keys"] = None
+        prefetch_job["run"] = None
+        prefetch_job["thread"] = None
 
     config = load_config()
     
@@ -1349,8 +1447,47 @@ def next_phase_analysis():
     with state_lock:
         if analysis_state["status"] != "awaiting_phase":
             raise HTTPException(status_code=400, detail="현재 다음 단계로 진행할 수 있는 대기 상태가 아닙니다.")
+        # 아직 응답하지 않은 사전 생성 승인 제안은 암묵적 거절로 처리하고 폐기한다.
+        # (이미 승인되어 실행 중인 스레드는 영향 없음 — 3단계 진입 전 join으로 수렴)
+        analysis_state["prefetch_offer"] = None
+    prefetch_job["run"] = None
     phase_gate_event.set()
     return {"message": "다음 단계 진행 요청 완료"}
+
+class PrefetchDecisionRequest(BaseModel):
+    accept: bool
+
+@app.post("/api/analyze/prefetch-decision")
+def decide_prefetch(req_body: PrefetchDecisionRequest):
+    """[Token Control — Trigger Isolation] Phase 1.5 사전 생성(LLM 토큰 소모)은
+    렌더링/폴링 사이클이 아니라 오직 이 엔드포인트, 즉 사용자의
+    [예, 사전 작업 진행] 버튼 onClick 이벤트에서만 발화된다.
+
+    - accept=true : 준비된 마이크로 배치 클로저를 백그라운드 스레드로 기동.
+    - accept=false: 제안 폐기 — 사전 작업 없이 대기 상태 유지, 누락 도서는 전부 JIT 처리.
+    """
+    with state_lock:
+        offer = analysis_state.get("prefetch_offer")
+        if analysis_state["status"] != "awaiting_phase" or not offer:
+            raise HTTPException(status_code=400, detail="현재 사전 작업 승인 대기 상태가 아닙니다.")
+        # 제안을 즉시 소거하여 중복 클릭(이중 기동)을 방지한다.
+        analysis_state["prefetch_offer"] = None
+
+    job = prefetch_job.get("run")
+    prefetch_job["run"] = None
+
+    if not req_body.accept:
+        add_log("⏭️ 사용자가 사전 생성을 건너뛰었습니다 — 누락 도서는 검증 시점에 1권 단위 JIT 생성됩니다 (대기 상태 유지, 토큰 소모 0).")
+        return {"message": "사전 작업 없이 대기 상태를 유지합니다.", "started": False}
+
+    if job is None:
+        raise HTTPException(status_code=400, detail="사전 작업이 이미 시작되었거나 더 이상 유효하지 않습니다.")
+
+    thread = threading.Thread(target=job, daemon=True)
+    prefetch_job["thread"] = thread
+    thread.start()
+    add_log(f"✅ 사용자 승인 완료 — Phase 1.5 마이크로 배치 선제 생성 {offer['sample_size']}권을 백그라운드에서 시작합니다.")
+    return {"message": f"사전 생성 {offer['sample_size']}권 시작", "started": True}
 
 class Stage3SelectionRequest(BaseModel):
     students: list[str]
@@ -1430,15 +1567,17 @@ async def enrich_factsheet(req: EnrichRequest):
          raise HTTPException(status_code=500, detail="LLM이 팩트시트 보강 결과를 생성하지 못했습니다.")
 
     # 4. 단일 마스터 파일(`book_cache.json`)에서 해당 Key의 데이터만 완벽하게 덮어쓰기(Overwrite) 및 동기화
-    book_cache = load_book_cache()
-    book_cache[cache_key] = {
-        "book_title": req.book_title,
-        "author": req.author,
-        "factsheet": enriched_content,
-        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "is_enriched": True
-    }
-    save_book_cache(book_cache)
+    #    (book_cache_lock: 파이프라인/선제생성 스레드와의 load-modify-save 경합 방지)
+    with book_cache_lock:
+        book_cache = load_book_cache()
+        book_cache[cache_key] = {
+            "book_title": req.book_title,
+            "author": req.author,
+            "factsheet": enriched_content,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "is_enriched": True
+        }
+        save_book_cache(book_cache)
     
     # 5. 기존의 로컬 factsheets/ 디렉토리 내 마크다운 파일도 즉시 동기화 업데이트
     try:
@@ -1459,6 +1598,11 @@ async def enrich_factsheet(req: EnrichRequest):
 
 @app.get("/api/analyze/status")
 def get_analysis_status():
+    """[Guard — Idle State Audit] 이 엔드포인트는 순수 읽기 전용(Read-Only)이다.
+    UI가 2초 주기로 폴링하더라도 인메모리 스냅샷 반환 외에 어떤 LLM API 호출·
+    파일 재연산도 발생하지 않는다. 토큰을 소비하는 로직은 오직 명시적 사용자
+    클릭 이벤트(POST /api/analyze, /next-phase, /stage3-selection, /enrich-factsheet)
+    에서만 발화된다 (Strict Event-Driven Control)."""
     with state_lock:
         return {
             "status": analysis_state["status"],
@@ -1469,6 +1613,12 @@ def get_analysis_status():
             "error_message": analysis_state["error_message"],
             "awaiting_phase": analysis_state.get("awaiting_phase"),
             "stage3_selection": analysis_state.get("stage3_selection"),
+            # Cache Miss로 JIT 생성 중인 도서명 (UI 스피너 "'{도서명}' 팩트시트 신규 생성 중...")
+            "factsheet_generating": analysis_state.get("factsheet_generating"),
+            # Phase 1.5 마이크로 배치 선제 생성 진행 정보
+            "prefetch": analysis_state.get("prefetch"),
+            # Phase 1.5 사전 생성 승인 제안 (사용자가 [예/아니오]를 선택하기 전까지 유지)
+            "prefetch_offer": analysis_state.get("prefetch_offer"),
         }
 
 @app.get("/api/results")
