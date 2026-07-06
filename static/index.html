@@ -82,6 +82,11 @@
                             </div>
                             <ul class="selected-files-list" id="selectedFilesList"></ul>
                         </div>
+                        <!-- [Data Ingestion 분리] 파일 읽기는 분석 파이프라인과 독립된 이 버튼에서만 수행.
+                             Smart Append: 학번(또는 이름) 중복 학생은 무시하고 신규 학생만 목록에 추가 -->
+                        <button type="button" class="btn btn-outline btn-block" id="btnImportData" style="margin-top: 10px; padding: 10px; font-weight: 600;">
+                            📥 데이터 가져오기 (중복 자동 병합)
+                        </button>
                     </div>
 
                     <!-- 모델 선택 드롭다운 (실시간 조합형) -->
@@ -334,6 +339,9 @@
                     <div class="results-header">
                         <h3>📋 선별 결과 목록</h3>
                         <div class="results-actions">
+                            <button class="btn btn-sm btn-primary" id="btnAddStudent" title="파일 없이 텍스트 복붙으로 학생 1명을 직접 추가합니다">
+                                👤 학생 수동 추가
+                            </button>
                             <select id="filterTier" class="form-select select-sm">
                                 <option value="all">모든 등급</option>
                                 <option value="최우선">🚨 최우선 (모순 검출)</option>
@@ -360,15 +368,16 @@
                     <div class="table-container">
                         <table class="data-table" id="resultsTable">
                             <thead>
+                                <!-- 헤더 클릭 시 해당 컬럼 기준 오름/내림차순 정렬 (🔼/🔽 표시) -->
                                 <tr>
-                                    <th>학번</th>
-                                    <th>이름</th>
-                                    <th>도서명</th>
-                                    <th>1단계 결과</th>
-                                    <th>2단계 스크리닝 결과</th>
-                                    <th>3단계 검증 결과</th>
-                                    <th>최종 판정 등급</th>
-                                    <th>조회</th>
+                                    <th class="sortable" data-sort="student_id" title="클릭하여 정렬">학번</th>
+                                    <th class="sortable" data-sort="student_name" title="클릭하여 정렬">이름</th>
+                                    <th class="sortable" data-sort="book_title" title="클릭하여 정렬">도서명</th>
+                                    <th class="sortable" data-sort="rule_score" title="클릭하여 정렬">1단계 결과</th>
+                                    <th class="sortable" data-sort="ai_score" title="클릭하여 정렬">2단계 스크리닝 결과</th>
+                                    <th class="sortable" data-sort="hallucination_score" title="클릭하여 정렬">3단계 검증 결과</th>
+                                    <th class="sortable" data-sort="tier" title="클릭하여 정렬">최종 판정 등급</th>
+                                    <th>조회 / 관리</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -567,6 +576,41 @@
                 <p class="modal-desc" id="factsheetViewPath" style="font-family: 'Courier New', monospace; font-size: 12px; color: var(--text-muted);"></p>
                 <div class="markdown-body" id="factsheetViewHtml">
                     <p class="text-center" style="color: var(--text-muted); padding:20px;">로딩 중...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 4-A. 학생 수동 추가 / 수정 모달 (CRUD) -->
+    <div class="modal-backdrop" id="modalStudentForm" style="display: none;">
+        <div class="modal card">
+            <div class="modal-header">
+                <h2 id="studentFormTitle">👤 학생 수동 추가</h2>
+                <button class="btn-close" id="btnCloseStudentForm">&times;</button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="sfOriginalKey" value="">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="sfStudentId">학번</label>
+                        <input type="text" id="sfStudentId" placeholder="예: 10701">
+                    </div>
+                    <div class="form-group">
+                        <label for="sfStudentName">이름 (필수)</label>
+                        <input type="text" id="sfStudentName" placeholder="예: 김철수">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="sfBookTitle">도서 제목</label>
+                    <input type="text" id="sfBookTitle" placeholder="예: 나쁜 교육(조너선 하이트)">
+                </div>
+                <div class="form-group">
+                    <label for="sfText">독후감 본문 (필수 — 텍스트를 그대로 붙여넣기 가능)</label>
+                    <textarea id="sfText" rows="10" style="width: 100%; box-sizing: border-box; resize: vertical; font-size: 13px;" placeholder="학생의 독후감 전문을 붙여넣으세요."></textarea>
+                </div>
+                <div class="modal-footer-actions" style="margin-top: 20px;">
+                    <button class="btn btn-outline" id="btnCancelStudentForm">취소</button>
+                    <button class="btn btn-primary" id="btnSubmitStudentForm">저장</button>
                 </div>
             </div>
         </div>

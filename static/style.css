@@ -1814,3 +1814,15 @@ body {
     display: flex;
     gap: 10px;
 }
+
+/* ------------------------------------------------------------------
+   선별 결과 목록: 클릭 정렬 가능 헤더 (🔼/🔽 인디케이터)
+   ------------------------------------------------------------------ */
+.data-table th.sortable {
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+}
+.data-table th.sortable:hover {
+    color: var(--color-primary);
+}

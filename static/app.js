@@ -826,26 +826,62 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // -------------------------------------------------------------
-    // Analysis Logic
+    // Data Ingestion (파일 읽기 — 분석 파이프라인과 완전 분리, Smart Append)
+    // -------------------------------------------------------------
+    const btnImportData = document.getElementById("btnImportData");
+    if (btnImportData) {
+        btnImportData.addEventListener("click", async () => {
+            const path = submissionsDir.value && submissionsDir.value.trim ? submissionsDir.value.trim() : submissionsDir.value;
+            if (!path) {
+                alert("먼저 가져올 제출물 파일을 선택해 주세요.");
+                return;
+            }
+            try {
+                btnImportData.disabled = true;
+                btnImportData.textContent = "가져오는 중...";
+                const res = await fetch("/api/data/import", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ path })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    alert(data.message);
+                    await fetchLastResults();   // 메모리 데이터셋(추가분 포함)을 목록에 즉시 반영
+                    await fetchSessionInfo();   // session_progress.json 동기화 정보 갱신
+                } else {
+                    alert(`데이터 가져오기 실패: ${data.detail || "알 수 없는 오류"}`);
+                }
+            } catch (err) {
+                console.error("데이터 가져오기 API 에러:", err);
+                alert("데이터 가져오기 중 통신 에러가 발생했습니다.");
+            } finally {
+                btnImportData.disabled = false;
+                btnImportData.textContent = "📥 데이터 가져오기 (중복 자동 병합)";
+            }
+        });
+    }
+
+    // -------------------------------------------------------------
+    // Analysis Logic — 파이프라인은 폴더를 읽지 않고 메모리 데이터셋만 순회한다
     // -------------------------------------------------------------
     async function startAnalysis() {
         const payload = {
-            submissions_dir: submissionsDir.value.trim ? submissionsDir.value.trim() : submissionsDir.value,
             verify_all: verifyAll.checked,
             no_verify: noVerify.checked,
             no_web: noWeb.checked,
-            
+
             screening_provider: selectScreeningProvider.value,
             screening_model: selectScreeningModel.value,
             verify_provider: selectVerifyProvider.value,
             verify_model: selectVerifyModel.value
         };
 
-        if (!payload.submissions_dir) {
-            alert("분석할 제출물 파일을 1개 이상 선택해 주세요.");
+        if (!currentResults || currentResults.length === 0) {
+            alert("적재된 학생 데이터가 없습니다. 먼저 [데이터 가져오기] 또는 [학생 수동 추가]로 학생을 등록해 주세요.");
             return;
         }
-        
+
         const regKeys = currentProfile.api_keys || [];
         if (!regKeys.includes(payload.screening_provider)) {
             alert(`2단계 스크리닝을 위한 ${payload.screening_provider.toUpperCase()} API Key가 등록되어 있지 않습니다. 키를 먼저 등록해 주세요.`);
@@ -1628,12 +1664,148 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    // -------------------------------------------------------------
+    // 학생 수동 추가 / 수정 모달 (CRUD)
+    // -------------------------------------------------------------
+    const modalStudentForm = document.getElementById("modalStudentForm");
+    const studentFormTitle = document.getElementById("studentFormTitle");
+    const sfOriginalKey = document.getElementById("sfOriginalKey");
+    const sfStudentId = document.getElementById("sfStudentId");
+    const sfStudentName = document.getElementById("sfStudentName");
+    const sfBookTitle = document.getElementById("sfBookTitle");
+    const sfText = document.getElementById("sfText");
+
+    function openStudentForm(mode, record) {
+        if (!modalStudentForm) return;
+        const isEdit = mode === "edit" && record;
+        sfOriginalKey.value = isEdit ? record.student : "";
+        studentFormTitle.textContent = isEdit ? `✏️ 학생 정보 수정: ${record.student}` : "👤 학생 수동 추가";
+        sfStudentId.value = isEdit ? (record.student_id || "") : "";
+        sfStudentName.value = isEdit ? (record.student_name || "") : "";
+        sfBookTitle.value = isEdit ? (record.book_title || "") : "";
+        sfText.value = isEdit ? (record.text || "") : "";
+        modalStudentForm.style.display = "flex";
+    }
+
+    function closeStudentForm() {
+        if (modalStudentForm) modalStudentForm.style.display = "none";
+    }
+
+    async function submitStudentForm() {
+        const originalKey = sfOriginalKey.value;
+        const body = {
+            student_id: sfStudentId.value.trim(),
+            student_name: sfStudentName.value.trim(),
+            book_title: sfBookTitle.value.trim(),
+            text: sfText.value.trim()
+        };
+        if (!body.student_name) {
+            alert("이름은 필수 입력입니다.");
+            return;
+        }
+        if (!originalKey && !body.text) {
+            alert("독후감 본문을 입력(붙여넣기)해 주세요.");
+            return;
+        }
+
+        const url = originalKey ? `/api/students/${encodeURIComponent(originalKey)}` : "/api/students";
+        const method = originalKey ? "PUT" : "POST";
+        try {
+            const res = await fetch(url, {
+                method,
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body)
+            });
+            const data = await res.json();
+            if (res.ok) {
+                closeStudentForm();
+                await fetchLastResults();  // 메모리 데이터셋 변경분 즉시 반영
+                await fetchSessionInfo();  // 세션 파일 저장 정보 갱신
+            } else {
+                alert(`저장 실패: ${data.detail || "알 수 없는 오류"}`);
+            }
+        } catch (err) {
+            console.error("학생 저장 API 에러:", err);
+            alert("저장 중 통신 에러가 발생했습니다.");
+        }
+    }
+
+    const btnAddStudent = document.getElementById("btnAddStudent");
+    if (btnAddStudent) {
+        btnAddStudent.addEventListener("click", () => openStudentForm("add", null));
+    }
+    const btnSubmitStudentForm = document.getElementById("btnSubmitStudentForm");
+    if (btnSubmitStudentForm) {
+        btnSubmitStudentForm.addEventListener("click", submitStudentForm);
+    }
+    const btnCancelStudentForm = document.getElementById("btnCancelStudentForm");
+    if (btnCancelStudentForm) {
+        btnCancelStudentForm.addEventListener("click", closeStudentForm);
+    }
+    const btnCloseStudentForm = document.getElementById("btnCloseStudentForm");
+    if (btnCloseStudentForm) {
+        btnCloseStudentForm.addEventListener("click", closeStudentForm);
+    }
+
+    // -------------------------------------------------------------
+    // 테이블 정렬 (th 클릭 → 오름차순/내림차순 토글, 🔼/🔽 인디케이터)
+    // -------------------------------------------------------------
+    let sortState = { key: null, dir: 1 }; // dir: 1=ASC, -1=DESC
+    const SORT_NUMERIC_KEYS = new Set(["rule_score", "ai_score", "hallucination_score"]);
+    const TIER_SORT_ORDER = { "최우선": 3, "상": 2, "중": 1, "하": 0 };
+
+    function sortValue(r, key) {
+        if (key === "tier") {
+            return TIER_SORT_ORDER[r.tier] !== undefined ? TIER_SORT_ORDER[r.tier] : -1;
+        }
+        const v = r[key];
+        if (SORT_NUMERIC_KEYS.has(key)) {
+            const n = parseFloat(v);
+            return isNaN(n) ? -Infinity : n; // 미실시/대기중은 항상 최하단(ASC 기준 최상단) 그룹
+        }
+        return (v === null || v === undefined) ? "" : String(v);
+    }
+
+    function updateSortIndicators() {
+        document.querySelectorAll("#resultsTable th.sortable").forEach(th => {
+            if (!th.dataset.label) th.dataset.label = th.textContent.trim();
+            th.textContent = th.dataset.sort === sortState.key
+                ? `${th.dataset.label} ${sortState.dir === 1 ? "🔼" : "🔽"}`
+                : th.dataset.label;
+        });
+    }
+
+    document.querySelectorAll("#resultsTable th.sortable").forEach(th => {
+        th.addEventListener("click", () => {
+            const key = th.dataset.sort;
+            if (sortState.key === key) {
+                sortState.dir = -sortState.dir; // 같은 컬럼 재클릭 → ASC/DESC 토글
+            } else {
+                sortState = { key, dir: 1 };
+            }
+            updateSortIndicators();
+            renderResultsTable(currentResults);
+        });
+    });
+
     function renderResultsTable(results) {
         const tier = filterTier.value;
         let filtered = results;
 
         if (tier !== "all") {
             filtered = results.filter(r => r.tier === tier);
+        }
+
+        // 정렬 적용 (원본 배열은 건드리지 않고 사본으로 정렬)
+        if (sortState.key) {
+            filtered = [...filtered].sort((a, b) => {
+                const va = sortValue(a, sortState.key);
+                const vb = sortValue(b, sortState.key);
+                const cmp = (typeof va === "number" && typeof vb === "number")
+                    ? va - vb
+                    : String(va).localeCompare(String(vb), "ko");
+                return cmp * sortState.dir;
+            });
         }
 
         if (filtered.length === 0) {
@@ -1684,13 +1856,15 @@ document.addEventListener("DOMContentLoaded", () => {
                     <td>${stage3Str}</td>
                     <td><span class="badge ${badgeClass}">${r.tier || "-"}</span></td>
                     <td>
-                        <div style="display: flex; gap: 6px;">
+                        <div style="display: flex; gap: 6px; align-items: center;">
                             <button class="btn btn-sm btn-outline btn-view-detail" data-student="${escapeHtml(r.student)}">
                                 상세보기
                             </button>
                             <button class="btn btn-sm btn-success btn-enrich-factsheet" data-title="${escapeHtml(r.book_title || '')}" data-author="${escapeHtml(r.author || r.stage2?.author || '')}">
                                 팩트시트 보강
                             </button>
+                            <button class="btn btn-sm btn-outline btn-edit-student" data-student="${escapeHtml(r.student)}" title="학생 정보 수정" style="padding: 4px 8px;">✏️</button>
+                            <button class="btn btn-sm btn-outline btn-delete-student" data-student="${escapeHtml(r.student)}" title="학생 삭제" style="padding: 4px 8px;">🗑️</button>
                         </div>
                     </td>
                 </tr>
@@ -1701,6 +1875,38 @@ document.addEventListener("DOMContentLoaded", () => {
             btn.addEventListener("click", () => {
                 const student = btn.dataset.student;
                 openStudentDetail(student);
+            });
+        });
+
+        // [CRUD] 행 단위 수정/삭제 액션
+        document.querySelectorAll(".btn-edit-student").forEach(btn => {
+            btn.addEventListener("click", () => {
+                const record = currentResults.find(r => r.student === btn.dataset.student);
+                if (!record) {
+                    alert("해당 학생 데이터를 찾을 수 없습니다.");
+                    return;
+                }
+                openStudentForm("edit", record);
+            });
+        });
+
+        document.querySelectorAll(".btn-delete-student").forEach(btn => {
+            btn.addEventListener("click", async () => {
+                const key = btn.dataset.student;
+                if (!confirm(`'${key}' 학생을 목록과 세션 파일에서 완전히 삭제하시겠습니까?\n(분석 결과 포함, 되돌릴 수 없습니다)`)) return;
+                try {
+                    const res = await fetch(`/api/students/${encodeURIComponent(key)}`, { method: "DELETE" });
+                    const data = await res.json();
+                    if (res.ok) {
+                        await fetchLastResults();
+                        await fetchSessionInfo();
+                    } else {
+                        alert(`삭제 실패: ${data.detail || "알 수 없는 오류"}`);
+                    }
+                } catch (err) {
+                    console.error("학생 삭제 API 에러:", err);
+                    alert("삭제 중 통신 에러가 발생했습니다.");
+                }
             });
         });
 

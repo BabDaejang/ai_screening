@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from utils.user_manager import UserManager
 from utils.cost_tracker import CostTracker
 from utils.docx_metadata import extract_docx_metadata
-from utils.file_reader import read_submissions
+from utils.file_reader import read_submissions, strip_float_tail
 from utils.report_generator import generate_csv, generate_report, calculate_tiers
 from utils.session_store import (
     save_session_progress,
@@ -223,7 +223,9 @@ class ModelSelectRequest(BaseModel):
     verify_model: str
 
 class AnalyzeRequest(BaseModel):
-    submissions_dir: str
+    # [Deprecated] 파일 읽기는 POST /api/data/import로 분리되었다.
+    # 파이프라인은 메모리 데이터셋만 순회하므로 이 필드는 더 이상 사용되지 않는다 (하위 호환용).
+    submissions_dir: str = ""
     verify_all: bool = False
     no_verify: bool = False
     no_web: bool = False
@@ -293,6 +295,46 @@ def find_cached_book_entry_by_title(book_title: str, book_cache: dict) -> Option
         if _normalize_title(entry.get("book_title", "") or "") == target:
             return cache_key, entry
     return None
+
+# -------------------------------------------------------------
+# 학생 레코드 식별자 정제 & 중복 판정 (메모리 데이터셋 공통 유틸)
+# -------------------------------------------------------------
+def sanitize_student_identity(record: dict) -> bool:
+    """레코드의 student_id/student_name/student(복합키)에서 Excel Float 캐스팅으로
+    붙은 후미 '.0' 꼬리표를 제거한다 (예: '10701.0' → '10701').
+
+    Returns:
+        정제로 인해 값이 하나라도 변경되었으면 True (마이그레이션 저장 판단용).
+    """
+    changed = False
+    for field in ("student_id", "student_name"):
+        raw = record.get(field)
+        if raw is None:
+            continue
+        cleaned = strip_float_tail(raw)
+        if cleaned != str(raw):
+            record[field] = cleaned
+            changed = True
+    student = record.get("student")
+    if student:
+        # 복합키('학번_이름')의 각 세그먼트를 개별 정제 — 순수 숫자+'.0' 형태만 변경되므로 안전
+        cleaned_key = "_".join(strip_float_tail(part) for part in str(student).split("_"))
+        if cleaned_key != str(student):
+            record["student"] = cleaned_key
+            changed = True
+    return changed
+
+def student_dedupe_key(record: dict) -> str:
+    """Smart Append 중복 판정 키: 학번이 있으면 학번 기준, 없으면 이름 기준."""
+    sid = strip_float_tail(record.get("student_id") or "")
+    if sid:
+        return f"id:{sid}"
+    name = str(record.get("student_name") or record.get("student") or "").strip()
+    return f"nm:{name}"
+
+def _pipeline_busy() -> bool:
+    """호출 전 state_lock을 잡은 상태에서 사용할 것: 파이프라인이 데이터셋을 순회 중인지 판정."""
+    return analysis_state["status"] in ("running", "paused", "awaiting_phase", "awaiting_stage3_selection")
 
 # '도서명(저자명)' 또는 '도서명[저자명]' 복합 텍스트에서 후미 괄호를 캡처한다.
 _TITLE_AUTHOR_PATTERN = re.compile(r'^(.+?)\s*[\(\[](.+?)[\)\]]$')
@@ -890,39 +932,224 @@ if selected:
 
 
 # -------------------------------------------------------------
+# Data Ingestion API — 파일 읽기를 파이프라인에서 완전히 분리 (DB형 메모리 상태 관리)
+# -------------------------------------------------------------
+class DataImportRequest(BaseModel):
+    path: str
+
+@app.post("/api/data/import")
+def import_data(req: DataImportRequest):
+    """[데이터 가져오기] 파일/폴더 → 메모리 데이터셋(analysis_state["results"]) 적재.
+
+    Smart Append: 기존에 로드되어 작업 중인 레코드는 절대 덮어쓰지 않는다.
+    학번(없으면 이름) 기준으로 중복 학생은 무시하고 신규 학생만 Append한 뒤
+    session_progress.json에 즉시 동기화한다. 이후 분석 파이프라인은 폴더를
+    다시 뒤지지 않고 이 메모리 데이터셋만 순회한다.
+    """
+    with state_lock:
+        if _pipeline_busy():
+            raise HTTPException(status_code=400, detail="분석이 진행 중일 때는 데이터를 가져올 수 없습니다. 먼저 정지해 주세요.")
+
+    path = (req.path or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="가져올 파일 또는 폴더 경로를 지정해 주세요.")
+
+    submissions = read_submissions(path)
+    if not submissions:
+        raise HTTPException(status_code=404, detail="지원되는 제출물을 찾지 못했습니다. (지원 형식: Excel, CSV, PDF, TXT, DOCX)")
+
+    # 메타데이터(docx)는 가져오기 시점에 1회만 추출 — 파이프라인은 파일을 다시 읽지 않는다.
+    for sub in submissions:
+        sanitize_student_identity(sub)
+        sub["filename"] = sub["student"]
+        if sub.get("file_type") == "docx":
+            try:
+                sub["metadata"] = extract_docx_metadata(sub["file_path"])
+            except Exception as e:
+                logger.warning(f"docx 메타데이터 추출 실패({sub.get('file_path')}): {e}")
+                sub["metadata"] = None
+        else:
+            sub["metadata"] = None
+
+    with state_lock:
+        existing_keys = {student_dedupe_key(r) for r in analysis_state["results"]}
+        added = []
+        skipped = 0
+        for sub in submissions:
+            key = student_dedupe_key(sub)
+            if key in existing_keys:
+                skipped += 1
+                continue
+            existing_keys.add(key)
+            added.append(sub)
+        analysis_state["results"].extend(added)
+        snapshot = list(analysis_state["results"])
+
+    save_session_progress(snapshot, status="loaded")
+    msg = f"데이터 가져오기 완료: 신규 {len(added)}명 추가, 중복 {skipped}명 무시 (총 {len(snapshot)}명 적재)"
+    add_log(f"📥 [Smart Append] {msg} — session_progress.json 동기화 완료.")
+    return {"message": msg, "added": len(added), "skipped": skipped, "total": len(snapshot)}
+
+# -------------------------------------------------------------
+# 학생 레코드 수동 CRUD API (메모리 상태 + 세션 파일 즉시 영속화)
+# -------------------------------------------------------------
+class StudentCreateRequest(BaseModel):
+    student_id: str = ""
+    student_name: str
+    book_title: str = ""
+    text: str
+
+class StudentUpdateRequest(BaseModel):
+    student_id: Optional[str] = None
+    student_name: Optional[str] = None
+    book_title: Optional[str] = None
+    text: Optional[str] = None
+
+def _build_student_key(student_id: str, student_name: str) -> str:
+    """'학번_이름' 복합키를 구성한다 (file_reader의 키 규칙과 동일)."""
+    if student_id and student_name:
+        return f"{student_id}_{student_name}"
+    return student_id or student_name
+
+def _persist_results_snapshot():
+    """state_lock 밖에서 호출: 현재 메모리 데이터셋을 session_progress.json에 저장."""
+    with state_lock:
+        snapshot = list(analysis_state["results"])
+    save_session_progress(snapshot, status="edited")
+    return len(snapshot)
+
+@app.post("/api/students")
+def create_student(req: StudentCreateRequest):
+    """[학생 수동 추가] 파일 없이 텍스트 복붙으로 학생 1명을 메모리 데이터셋에 추가한다."""
+    student_id = strip_float_tail(req.student_id or "")
+    student_name = (req.student_name or "").strip()
+    text = (req.text or "").strip()
+    if not student_name:
+        raise HTTPException(status_code=400, detail="이름은 필수 입력입니다.")
+    if not text:
+        raise HTTPException(status_code=400, detail="독후감 본문은 필수 입력입니다.")
+
+    record = {
+        "student": _build_student_key(student_id, student_name),
+        "student_id": student_id,
+        "student_name": student_name,
+        "book_title": (req.book_title or "").strip() or None,
+        "text": text,
+        "file_path": "",
+        "file_type": "manual",
+        "filename": _build_student_key(student_id, student_name),
+        "metadata": None,
+    }
+
+    with state_lock:
+        if _pipeline_busy():
+            raise HTTPException(status_code=400, detail="분석이 진행 중일 때는 학생을 추가할 수 없습니다.")
+        existing_keys = {student_dedupe_key(r) for r in analysis_state["results"]}
+        if student_dedupe_key(record) in existing_keys:
+            raise HTTPException(status_code=409, detail=f"이미 등록된 학생입니다: {record['student']}")
+        analysis_state["results"].append(record)
+
+    total = _persist_results_snapshot()
+    add_log(f"➕ [수동 추가] 학생 '{record['student']}' 등록 완료 (총 {total}명) — 세션 파일 동기화.")
+    return {"message": f"학생 '{record['student']}' 추가 완료", "student": record["student"], "total": total}
+
+@app.put("/api/students/{student_key}")
+def update_student(student_key: str, req: StudentUpdateRequest):
+    """[수정] 학생 레코드의 학번/이름/도서명/본문을 갱신한다 (student_key = '학번_이름' 복합키)."""
+    with state_lock:
+        if _pipeline_busy():
+            raise HTTPException(status_code=400, detail="분석이 진행 중일 때는 학생 정보를 수정할 수 없습니다.")
+        record = next((r for r in analysis_state["results"] if str(r.get("student")) == student_key), None)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"해당 학생을 찾을 수 없습니다: {student_key}")
+
+        # 1) 변경 후보값을 먼저 계산하고 키 충돌을 검증한 뒤, 2) 통과 시에만 일괄 적용한다
+        #    (충돌 시 레코드가 부분적으로만 변경되는 것을 방지 — Atomic Update).
+        new_id = strip_float_tail(req.student_id) if req.student_id is not None else record.get("student_id", "")
+        new_name = (req.student_name.strip() if req.student_name is not None and req.student_name.strip()
+                    else record.get("student_name", ""))
+        new_key = _build_student_key(new_id, new_name)
+        if new_key and new_key != student_key:
+            if any(str(r.get("student")) == new_key for r in analysis_state["results"] if r is not record):
+                raise HTTPException(status_code=409, detail=f"동일 키의 학생이 이미 존재합니다: {new_key}")
+
+        record["student_id"] = new_id
+        record["student_name"] = new_name
+        if req.book_title is not None:
+            record["book_title"] = req.book_title.strip() or None
+        if req.text is not None and req.text.strip():
+            record["text"] = req.text.strip()
+        if new_key and new_key != student_key:
+            record["student"] = new_key
+            record["filename"] = new_key
+
+    total = _persist_results_snapshot()
+    add_log(f"✏️ [수정] 학생 '{student_key}' → '{record['student']}' 정보 갱신 완료 — 세션 파일 동기화.")
+    return {"message": f"학생 '{record['student']}' 수정 완료", "student": record["student"], "total": total}
+
+@app.delete("/api/students/{student_key}")
+def delete_student(student_key: str):
+    """[삭제] 학생 레코드를 메모리 데이터셋과 세션 파일에서 제거한다."""
+    with state_lock:
+        if _pipeline_busy():
+            raise HTTPException(status_code=400, detail="분석이 진행 중일 때는 학생을 삭제할 수 없습니다.")
+        before = len(analysis_state["results"])
+        analysis_state["results"] = [
+            r for r in analysis_state["results"] if str(r.get("student")) != student_key
+        ]
+        removed = before - len(analysis_state["results"])
+        if removed == 0:
+            raise HTTPException(status_code=404, detail=f"해당 학생을 찾을 수 없습니다: {student_key}")
+
+    total = _persist_results_snapshot()
+    add_log(f"🗑️ [삭제] 학생 '{student_key}' 제거 완료 (총 {total}명) — 세션 파일 동기화.")
+    return {"message": f"학생 '{student_key}' 삭제 완료", "total": total}
+
+# -------------------------------------------------------------
 # 분석 API & 백그라운드 태스크
 # -------------------------------------------------------------
 def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
     global analysis_state
     
     try:
-        update_progress(5, "제출물 파일 읽는 중...")
-        add_log(f"📂 제출물 디렉토리: {req.submissions_dir}")
-        
+        update_progress(5, "메모리 데이터셋 로드 중...")
+
         # API 키 검증
         api_keys = session_data.get("api_keys", {})
         screening_key = api_keys.get(req.screening_provider)
         verify_key = api_keys.get(req.verify_provider)
-        
+
         if not screening_key:
             raise Exception(f"2단계 스크리닝을 위한 {req.screening_provider} API Key가 등록되지 않았습니다.")
         if not req.no_verify and not verify_key:
             raise Exception(f"3단계 사실 검증을 위한 {req.verify_provider} API Key가 등록되지 않았습니다.")
-            
-        submissions = read_submissions(req.submissions_dir)
-        if not submissions:
-            raise Exception("제출물 파일이 발견되지 않았습니다. 지원 형식: Excel, CSV, PDF, TXT, DOCX")
-            
-        add_log(f"✅ {len(submissions)}개 제출물 로드 완료.")
 
-        # docx 메타데이터 추출
-        update_progress(15, "메타데이터 추출 중...")
+        # [Data Ingestion 분리] 파이프라인은 더 이상 폴더/파일을 직접 읽지 않는다.
+        # [데이터 가져오기](POST /api/data/import)·[학생 수동 추가](POST /api/students)로
+        # 적재된 analysis_state["results"] 인메모리 데이터셋만을 대상으로 순회(Iterate)한다.
+        # 아래 submissions의 각 원소는 analysis_state["results"]와 '동일한 dict 객체'이므로
+        # 이후 단계별 in-place 갱신이 별도 재대입 없이 UI(/api/results)에 즉시 반영된다.
+        with state_lock:
+            submissions = list(analysis_state["results"])
+        if not submissions:
+            raise Exception("적재된 학생 데이터가 없습니다. 먼저 [데이터 가져오기] 또는 [학생 수동 추가]로 학생을 등록해 주세요.")
+
+        add_log(f"✅ 메모리 데이터셋 {len(submissions)}명 로드 완료 (파일 재스캔 없음).")
+
+        # 메타데이터 보충: 가져오기 시점에 이미 추출되어 있으므로, 구버전 세션 복원 등
+        # 메타데이터 필드가 없는 레코드에 한해서만 1회 보충한다.
+        update_progress(15, "메타데이터 확인 중...")
         for sub in submissions:
-            sub["filename"] = sub["student"]
-            if sub["file_type"] == "docx":
-                sub["metadata"] = extract_docx_metadata(sub["file_path"])
-            else:
-                sub["metadata"] = None
+            sub["filename"] = sub.get("filename") or sub["student"]
+            if "metadata" not in sub:
+                if sub.get("file_type") == "docx" and sub.get("file_path") and os.path.exists(sub["file_path"]):
+                    try:
+                        sub["metadata"] = extract_docx_metadata(sub["file_path"])
+                    except Exception as e:
+                        logger.warning(f"docx 메타데이터 보충 실패({sub.get('file_path')}): {e}")
+                        sub["metadata"] = None
+                else:
+                    sub["metadata"] = None
 
         # CostTracker 설정
         cost_tracker = CostTracker(config)
@@ -946,7 +1173,14 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
         submissions_to_process = []
         for sub in submissions:
             if sub["student"] in completed_map:
-                resumed_results.append(completed_map[sub["student"]])
+                # 체크포인트 데이터를 '메모리 레코드 자체'에 병합한다 (동일 dict 객체 유지).
+                # 리스트를 재대입하지 않으므로 미처리 학생도 UI 목록에서 사라지지 않는다.
+                checkpoint = completed_map[sub["student"]]
+                for k, v in checkpoint.items():
+                    if k == "text" and not v and sub.get("text"):
+                        continue  # CSV 백필 등 본문이 비어있는 체크포인트가 원본 본문을 지우지 않도록 보호
+                    sub[k] = v
+                resumed_results.append(sub)
             else:
                 submissions_to_process.append(sub)
 
@@ -954,20 +1188,15 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
             add_log(f"🔁 체크포인트 발견: {len(resumed_results)}명은 이전에 이미 완료되어 스킵합니다 (중복 API 호출/토큰 소모 0).")
         add_log(f"▶️ 신규 처리 대상: {len(submissions_to_process)}명")
 
-        # UI State Synchronization: 재개된 결과를 [선별 결과 목록]에 즉시 반영
-        with state_lock:
-            analysis_state["results"] = list(resumed_results)
-
         new_results: list = []
 
         def _finalize_and_persist_student(r: dict):
             """피실험자 1명(Atomic Unit)의 처리가 최종 완료되는 즉시 로컬 파일에
-            append-only로 영속화하고, 동시에 상위 UI 레이어에 실시간으로 반영한다.
-            세션 스냅샷(session_progress.json)도 함께 갱신하여, 서버가 언제
-            재기동되더라도(또는 파일을 타 PC로 옮기더라도) 이어서 작업할 수 있다."""
+            append-only로 영속화한다. 레코드는 analysis_state["results"] 내 동일 객체이므로
+            UI에는 이미 실시간 반영된 상태이며, 세션 스냅샷(session_progress.json)도 함께
+            갱신하여 서버가 언제 재기동되더라도 이어서 작업할 수 있다."""
             append_screening_result(r)
             with state_lock:
-                analysis_state["results"] = resumed_results + list(new_results)
                 snapshot = list(analysis_state["results"])
             save_session_progress(snapshot, status="running")
 
@@ -979,30 +1208,21 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
             for i, sub in enumerate(submissions_to_process, 1):
                 check_control_state("1단계", i, len(submissions_to_process), sub["student"])
                 add_log(f"[1단계] ({i}/{len(submissions_to_process)}) {sub['student']} 검사 중...")
-                stage1_res = run_stage1(sub["text"], sub["metadata"], sub["filename"], config)
+                stage1_res = run_stage1(sub.get("text", ""), sub.get("metadata"), sub["filename"], config)
                 # '도서명(저자명)' 복합 텍스트 파싱: 도서명 필드에 후미 괄호로 저자명이
                 # 붙어 들어온 경우, 여기서 즉시 분리하여 저자 정보 유실을 방지한다.
                 parsed_book_title, parsed_author = parse_book_title_author(sub.get("book_title"))
-                res_item = {
-                    "student": sub["student"],
-                    "student_id": sub.get("student_id", ""),
+                # 메모리 레코드(동일 dict 객체)를 in-place 갱신 → 재대입 없이 UI 즉시 반영
+                sub.update({
                     "student_name": sub.get("student_name") or sub["student"],
                     "book_title": parsed_book_title,
-                    "author": parsed_author or "",
-                    "text": sub["text"],
-                    "file_type": sub["file_type"],
-                    "file_path": sub["file_path"],
-                    "metadata": sub["metadata"],
+                    "author": parsed_author or sub.get("author") or "",
                     "rule_score": stage1_res["rule_score"],
                     # 1단계 위험도 등급 (Safe/Warning/Danger) — UI 배지 시각화용
                     "risk_grade": stage1_res.get("risk_grade", ""),
-                    "rule_details": stage1_res["details"]
-                }
-                new_results.append(res_item)
-
-                # UI State Synchronization: 대상 식별 및 도서 매핑 완료 즉시 반영
-                with state_lock:
-                    analysis_state["results"] = resumed_results + list(new_results)
+                    "rule_details": stage1_res["details"],
+                })
+                new_results.append(sub)
 
             # book_cache / factsheets_dir / book_author_map은 Phase 1.5 마이크로 배치 선제
             # 생성 스레드와 3단계 JIT 팩트시트 확보 로직이 공유하는 상태이므로 한 번만 초기화한다.
@@ -1132,7 +1352,7 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                 submissions_to_screen.append({
                     "student": r["student"],
                     "filename": r["student"],
-                    "text": r["text"]
+                    "text": r.get("text", "")
                 })
 
             def _on_stage2_item_done(screened_sub: dict):
@@ -1147,8 +1367,7 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                 r["stage2"] = stage2_info
                 if stage2_info.get("error"):
                     add_log(f"⚠️ 경고: {r['student']} 학생의 스크리닝 중 오류가 발생했습니다. (사유: {stage2_info.get('rationale')})")
-                with state_lock:
-                    analysis_state["results"] = resumed_results + list(new_results)
+                # r은 analysis_state["results"] 내 동일 객체이므로 별도 재대입 없이 UI 즉시 반영
 
             run_stage2(
                 submissions_to_screen, provider_screening, config,
@@ -1164,8 +1383,7 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                 if original_tier is not None:
                     r["tier"] = original_tier
 
-            with state_lock:
-                analysis_state["results"] = resumed_results + list(new_results)
+            # (tier 산출 결과도 동일 객체 in-place 갱신으로 UI에 이미 반영됨)
 
             # 3단계 사실 검증 대상자 확정 (사용자 주도형 듀얼 패널 선택, no_verify가 최우선)
             if req.no_verify:
@@ -1382,7 +1600,8 @@ def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks):
         analysis_state["progress"] = 0
         analysis_state["step"] = "준비 중..."
         analysis_state["logs"] = []
-        analysis_state["results"] = []
+        # [DB형 상태 관리] results는 파이프라인 실행 전 적재된 영속 데이터셋이므로
+        # 절대 초기화하지 않는다 — 파이프라인이 이 데이터셋을 그대로 순회한다.
         analysis_state["cost_summary"] = {}
         analysis_state["error_message"] = ""
         analysis_state["awaiting_phase"] = None
@@ -2047,9 +2266,17 @@ global_user_manager = UserManager()
 # -------------------------------------------------------------
 _restored_session = load_session_progress()
 if _restored_session and _restored_session.get("results"):
+    # [마이그레이션] 기 등록된 세션 데이터의 학번/이름 '.0' 꼬리표(Excel Float 캐스팅 잔재)를
+    # 앱 기동 시 일괄 정제한다 (예: '10701.0' → '10701'). 변경분이 있으면 즉시 재저장.
+    _migrated_count = sum(
+        1 for _r in _restored_session["results"] if sanitize_student_identity(_r)
+    )
     with state_lock:
         analysis_state["results"] = _restored_session["results"]
         analysis_state["cost_summary"] = _restored_session.get("cost_summary", {})
+    if _migrated_count:
+        save_session_progress(_restored_session["results"], _restored_session.get("cost_summary"), status="migrated")
+        logger.info("학번 '.0' 꼬리표 마이그레이션 완료: %d명 정제 후 세션 파일 재저장.", _migrated_count)
     logger.info(
         "이전 세션 자동 복원 완료: %d명 (저장 시각: %s, 파일: %s)",
         len(_restored_session["results"]),

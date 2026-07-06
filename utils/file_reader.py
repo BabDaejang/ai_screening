@@ -7,10 +7,29 @@ Excel/CSV의 경우 여러 학생의 기록이 들어있는 테이블(Table) 형
 import os
 import csv
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Excel 숫자형 캐스팅으로 붙는 후미 ".0" 패턴 (예: "10701.0")
+_FLOAT_TAIL_RE = re.compile(r"^(\d+)\.0+$")
+
+
+def strip_float_tail(val) -> str:
+    """엑셀에서 숫자형이 Float로 캐스팅되며 붙는 후미 '.0'을 완벽히 제거한 정제 문자열을 반환한다.
+
+    예: 10701.0 (float) → "10701", "10701.0" (str) → "10701", "김철수" → "김철수".
+    순수 정수 + '.0' 꼬리표 형태만 정제하므로 소수점이 유의미한 값("3.5" 등)은 건드리지 않는다.
+    """
+    if val is None:
+        return ""
+    if isinstance(val, float) and val.is_integer():
+        return str(int(val))
+    s = str(val).strip()
+    m = _FLOAT_TAIL_RE.match(s)
+    return m.group(1) if m else s
 
 
 def _read_txt(file_path: str) -> Optional[str]:
@@ -215,6 +234,10 @@ def _parse_tabular_rows(rows: list[list[str]], file_path: str) -> list[dict]:
         name_val = "" if _is_blank(name_val) else name_val
         book_val = None if _is_blank(book_val) else book_val
         text_val = "" if _is_blank(text_val) else text_val
+
+        # Excel 숫자형 캐스팅 정제: "10701.0" → "10701" (학번·이름 컬럼 공통 적용)
+        id_val = strip_float_tail(id_val)
+        name_val = strip_float_tail(name_val)
 
         # 학번_이름 복합키 구성 (학번이 있으면 결합, 없으면 이름만 사용)
         if id_val and name_val:
