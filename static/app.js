@@ -89,9 +89,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const btnCancelRegisterKey = document.getElementById("btnCancelRegisterKey");
     const btnRegisterKeySubmit = document.getElementById("btnRegisterKeySubmit");
 
-    // Analysis Panel
-    const submissionsDir = document.getElementById("submissionsDir");
+    // Analysis Panel — 브라우저 파일 업로드 방식 (tkinter 네이티브 다이얼로그 폐기)
     const btnBrowseFile = document.getElementById("btnBrowseFile");
+    const btnBrowseFolder = document.getElementById("btnBrowseFolder");
+    const inputUploadFiles = document.getElementById("inputUploadFiles");
+    const inputUploadFolder = document.getElementById("inputUploadFolder");
     const selectedFilesBox = document.getElementById("selectedFilesBox");
     const selectedFilesList = document.getElementById("selectedFilesList");
     const selectedFilesCount = document.getElementById("selectedFilesCount");
@@ -236,8 +238,24 @@ document.addEventListener("DOMContentLoaded", () => {
     btnCloseRegisterKeyModal.addEventListener("click", () => modalRegisterKey.style.display = "none");
     btnRegisterKeySubmit.addEventListener("click", submitBatchRegisterKeys);
 
+    // 파일/폴더 선택: 숨김 <input type="file">를 대신 클릭 (브라우저 표준 다이얼로그)
     if (btnBrowseFile) {
-        btnBrowseFile.addEventListener("click", openNativeFilePicker);
+        btnBrowseFile.addEventListener("click", () => {
+            inputUploadFiles.value = "";   // 같은 파일 재선택도 change 이벤트가 발생하도록 초기화
+            inputUploadFiles.click();
+        });
+    }
+    if (btnBrowseFolder) {
+        btnBrowseFolder.addEventListener("click", () => {
+            inputUploadFolder.value = "";
+            inputUploadFolder.click();
+        });
+    }
+    if (inputUploadFiles) {
+        inputUploadFiles.addEventListener("change", () => addPickedFiles(inputUploadFiles.files));
+    }
+    if (inputUploadFolder) {
+        inputUploadFolder.addEventListener("change", () => addPickedFiles(inputUploadFolder.files));
     }
 
     if (btnClearFiles) {
@@ -360,71 +378,58 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     });
 
-    async function openNativeFilePicker() {
-        // 버튼 비활성화 + 로딩 표시
-        btnBrowseFile.disabled = true;
-        const origText = btnBrowseFile.innerHTML;
-        btnBrowseFile.innerHTML = `
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" style="animation:spin 1s linear infinite">
-                <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
-            </svg>
-            열리는 중...`;
+    // 지원 확장자 (폴더 업로드에는 이미지 등 무관한 파일이 섞이므로 클라이언트에서 1차 필터링)
+    const SUPPORTED_UPLOAD_EXTS = [".txt", ".docx", ".pdf", ".xlsx", ".xls", ".csv"];
 
-        try {
-            const currentVal = submissionsDir.value.trim();
-            const url = currentVal
-                ? `/api/pick-file?initial=${encodeURIComponent(currentVal)}`
-                : `/api/pick-file`;
-            const res = await fetch(url);
-            if (!res.ok) {
-                const err = await res.json();
-                alert(`파일 선택 오류: ${err.detail}`);
-                return;
-            }
-            const data = await res.json();
-            if (data.path) {
-                const newPaths = data.path.split(';').map(p => p.trim()).filter(p => p);
-                newPaths.forEach(p => {
-                    if (!selectedFiles.includes(p)) {
-                        selectedFiles.push(p);
-                    }
-                });
-                updateSelectedFilesUI();
-            }
-            // data.path === null 이면 취소 - 조용히 무시
-        } catch (err) {
-            console.error("파일 선택 API 오류:", err);
-            alert("파일 선택 중 오류가 발생했습니다.");
-        } finally {
-            btnBrowseFile.disabled = false;
-            btnBrowseFile.innerHTML = origText;
+    function isSupportedUploadFile(file) {
+        const name = (file.name || "").toLowerCase();
+        return SUPPORTED_UPLOAD_EXTS.some(ext => name.endsWith(ext));
+    }
+
+    // 파일/폴더 input에서 선택된 File 객체들을 selectedFiles에 누적한다 (이름+크기 기준 중복 제거)
+    function addPickedFiles(fileList) {
+        const picked = Array.from(fileList || []);
+        if (picked.length === 0) return;
+
+        const supported = picked.filter(isSupportedUploadFile);
+        const skipped = picked.length - supported.length;
+
+        supported.forEach(f => {
+            const dup = selectedFiles.some(sf => sf.name === f.name && sf.size === f.size);
+            if (!dup) selectedFiles.push(f);
+        });
+        updateSelectedFilesUI();
+
+        if (skipped > 0) {
+            alert(`미지원 형식 ${skipped}개 파일은 제외되었습니다. (지원: Excel, CSV, PDF, TXT, DOCX)`);
         }
     }
 
+    function formatFileSize(bytes) {
+        if (!bytes && bytes !== 0) return "";
+        if (bytes < 1024) return `${bytes}B`;
+        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+        return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+    }
+
     function updateSelectedFilesUI() {
-        submissionsDir.value = selectedFiles.join(';');
-        
         if (selectedFiles.length === 0) {
             selectedFilesBox.style.display = "none";
             selectedFilesList.innerHTML = "";
             selectedFilesCount.textContent = "0";
             return;
         }
-        
+
         selectedFilesBox.style.display = "block";
         selectedFilesCount.textContent = selectedFiles.length;
-        
-        selectedFilesList.innerHTML = selectedFiles.map((file, index) => {
-            const parts = file.split('\\');
-            const filename = parts[parts.length - 1];
-            return `
+
+        selectedFilesList.innerHTML = selectedFiles.map((file, index) => `
                 <li>
-                    <span class="selected-file-name" title="${escapeHtml(file)}">${escapeHtml(filename)}</span>
+                    <span class="selected-file-name" title="${escapeHtml(file.name)} (${formatFileSize(file.size)})">${escapeHtml(file.name)}</span>
                     <button type="button" class="btn-remove-file" data-index="${index}">&times;</button>
                 </li>
-            `;
-        }).join('');
-        
+            `).join('');
+
         selectedFilesList.querySelectorAll(".btn-remove-file").forEach(btn => {
             btn.addEventListener("click", () => {
                 const index = parseInt(btn.dataset.index);
@@ -995,35 +1000,41 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // -------------------------------------------------------------
-    // Data Ingestion (파일 읽기 — 분석 파이프라인과 완전 분리, Smart Append)
+    // Data Ingestion (브라우저 파일 업로드 — 분석 파이프라인과 완전 분리, Smart Append)
+    // 선택된 File 객체들을 multipart/form-data로 서버에 업로드한다.
+    // (Content-Type 헤더는 브라우저가 boundary와 함께 자동 설정 — 수동 지정 금지)
     // -------------------------------------------------------------
     const btnImportData = document.getElementById("btnImportData");
     if (btnImportData) {
         btnImportData.addEventListener("click", async () => {
-            const path = submissionsDir.value && submissionsDir.value.trim ? submissionsDir.value.trim() : submissionsDir.value;
-            if (!path) {
-                alert("먼저 가져올 제출물 파일을 선택해 주세요.");
+            if (selectedFiles.length === 0) {
+                alert("먼저 가져올 제출물 파일(또는 폴더)을 선택해 주세요.");
                 return;
             }
             try {
                 btnImportData.disabled = true;
-                btnImportData.textContent = "가져오는 중...";
-                const res = await fetch("/api/data/import", {
+                btnImportData.textContent = `업로드 중... (${selectedFiles.length}개 파일)`;
+
+                const formData = new FormData();
+                selectedFiles.forEach(f => formData.append("files", f, f.name));
+
+                const res = await fetch("/api/data/upload", {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ path })
+                    body: formData
                 });
                 const data = await res.json();
                 if (res.ok) {
                     alert(data.message);
+                    selectedFiles = [];         // 적재 완료된 파일 목록은 비워서 중복 업로드 방지
+                    updateSelectedFilesUI();
                     await fetchLastResults();   // 메모리 데이터셋(추가분 포함)을 목록에 즉시 반영
-                    await fetchSessionInfo();   // session_progress.json 동기화 정보 갱신
+                    await fetchSessionInfo();   // 세션 DB 동기화 정보 갱신
                 } else {
                     alert(`데이터 가져오기 실패: ${data.detail || "알 수 없는 오류"}`);
                 }
             } catch (err) {
-                console.error("데이터 가져오기 API 에러:", err);
-                alert("데이터 가져오기 중 통신 에러가 발생했습니다.");
+                console.error("데이터 업로드 API 에러:", err);
+                alert("데이터 업로드 중 통신 에러가 발생했습니다.");
             } finally {
                 btnImportData.disabled = false;
                 btnImportData.textContent = "📥 데이터 가져오기 (중복 자동 병합)";

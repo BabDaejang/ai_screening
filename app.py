@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -224,7 +225,7 @@ class ModelSelectRequest(BaseModel):
     verify_model: str
 
 class AnalyzeRequest(BaseModel):
-    # [Deprecated] 파일 읽기는 POST /api/data/import로 분리되었다.
+    # [Deprecated] 파일 읽기는 POST /api/data/upload(브라우저 업로드)로 분리되었다.
     # 파이프라인은 메모리 데이터셋만 순회하므로 이 필드는 더 이상 사용되지 않는다 (하위 호환용).
     submissions_dir: str = ""
     verify_all: bool = False
@@ -777,127 +778,10 @@ def refresh_config(req: Optional[RefreshConfigRequest] = None, user: dict = Depe
         "message": message
     }
 
-# -------------------------------------------------------------
-# 네이티브 폴더 선택 다이얼로그 API
-# -------------------------------------------------------------
-@app.get("/api/pick-folder")
-def pick_folder(initial: str = ""):
-    """서브프로세스에서 tkinter를 사용해 네이티브 OS 폴더 선택 창을 열고 선택된 경로를 반환합니다."""
-    import subprocess
-    import sys
-    
-    script = f"""
-import tkinter as tk
-from tkinter import filedialog
-import os
-
-root = tk.Tk()
-root.withdraw()
-root.attributes("-topmost", True)
-
-initial = {repr(initial)}
-start_dir = initial if initial and os.path.isdir(initial) else os.path.expanduser("~")
-
-selected = filedialog.askdirectory(
-    title="제출물 폴더를 선택하세요",
-    initialdir=start_dir,
-    mustexist=True
-)
-if selected:
-    print(selected.replace("/", "\\\\"), end="")
-"""
-    try:
-        encoding_type = "cp949" if sys.platform == "win32" else "utf-8"
-        res = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True,
-            text=True,
-            encoding=encoding_type,
-            errors="ignore",
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        )
-        if res.returncode != 0:
-            err_msg = res.stderr.strip() if res.stderr else f"Exit code: {res.returncode}"
-            logger.error(f"폴더 선택 서브프로세스 실패: {err_msg}")
-            raise HTTPException(status_code=500, detail=f"폴더 선택 탐색기 실행 실패: {err_msg}")
-            
-        path = res.stdout.strip() if res.stdout else None
-        return {"path": path}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"폴더 선택 에러: {e}")
-        raise HTTPException(status_code=500, detail=f"폴더 선택 에러: {e}")
-
-
-@app.get("/api/pick-file")
-def pick_file(initial: str = ""):
-    """서브프로세스에서 tkinter를 사용해 네이티브 OS 파일 선택 창을 열고 선택된 다중 경로를 반환합니다."""
-    import subprocess
-    import sys
-    
-    script = f"""
-import tkinter as tk
-from tkinter import filedialog
-import os
-
-root = tk.Tk()
-root.withdraw()
-root.attributes("-topmost", True)
-
-initial = {repr(initial)}
-if initial:
-    # 다중 경로 구분자인 세미콜론이 있으면 첫 번째 파일 경로 기준으로 폴더 결정
-    first_path = initial.split(";")[0].strip()
-    if os.path.isdir(first_path):
-        start_dir = first_path
-    elif os.path.isfile(first_path):
-        start_dir = os.path.dirname(first_path)
-    else:
-        start_dir = os.path.expanduser("~")
-else:
-    start_dir = os.path.expanduser("~")
-
-selected = filedialog.askopenfilenames(
-    title="제출물 파일들을 선택하세요",
-    initialdir=start_dir,
-    filetypes=[
-        ("모든 지원 파일", "*.txt *.docx *.pdf *.xlsx *.xls *.csv"),
-        ("텍스트 파일 (*.txt)", "*.txt"),
-        ("Word 문서 (*.docx)", "*.docx"),
-        ("PDF 문서 (*.pdf)", "*.pdf"),
-        ("Excel 통합 문서 (*.xlsx *.xls)", "*.xlsx *.xls"),
-        ("CSV 파일 (*.csv)", "*.csv"),
-        ("모든 파일 (*.*)", "*.*")
-    ]
-)
-if selected:
-    paths = ";".join(selected)
-    print(paths.replace("/", "\\\\"), end="")
-"""
-    try:
-        encoding_type = "cp949" if sys.platform == "win32" else "utf-8"
-        res = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True,
-            text=True,
-            encoding=encoding_type,
-            errors="ignore",
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        )
-        if res.returncode != 0:
-            err_msg = res.stderr.strip() if res.stderr else f"Exit code: {res.returncode}"
-            logger.error(f"파일 선택 서브프로세스 실패: {err_msg}")
-            raise HTTPException(status_code=500, detail=f"파일 선택 탐색기 실행 실패: {err_msg}")
-            
-        path = res.stdout.strip() if res.stdout else None
-        return {"path": path}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"파일 선택 에러: {e}")
-        raise HTTPException(status_code=500, detail=f"파일 선택 에러: {e}")
-
+# [제거됨] 네이티브 폴더/파일 선택 다이얼로그 API (/api/pick-folder, /api/pick-file)
+# tkinter filedialog는 데스크톱 GUI 전용이라 서버리스(headless) 환경에서 동작 불가하고,
+# '서버 = 사용자 PC'였던 로컬 실행 시절의 잔재다. 파일 선택은 브라우저
+# <input type="file">(+webkitdirectory 폴더 업로드) → POST /api/data/upload로 대체되었다.
 
 # -------------------------------------------------------------
 # 다중 프로젝트(Workspace) 관리 API
@@ -997,46 +881,21 @@ def api_delete_project(project_id: str, user: dict = Depends(get_current_user)):
     return {"message": "프로젝트 삭제 완료", "deactivated": is_active_target}
 
 # -------------------------------------------------------------
-# Data Ingestion API — 파일 읽기를 파이프라인에서 완전히 분리 (DB형 메모리 상태 관리)
+# Data Ingestion API — 브라우저 파일 업로드 기반 (서버리스 호환)
+# [제거됨] 경로 기반 POST /api/data/import: 서버가 사용자 로컬 경로에 접근할 수
+# 없는 원격 배포 구조에서는 성립하지 않으므로 삭제됨. 로컬 경로 일괄 분석이
+# 필요하면 CLI(python screen.py ./submissions/)를 사용한다.
 # -------------------------------------------------------------
-class DataImportRequest(BaseModel):
-    path: str
+_SUPPORTED_UPLOAD_EXTS = {".txt", ".docx", ".pdf", ".xlsx", ".xls", ".csv"}
 
-@app.post("/api/data/import")
-def import_data(req: DataImportRequest, user: dict = Depends(get_current_user)):
-    """[데이터 가져오기] 파일/폴더 → 메모리 데이터셋(analysis_state["results"]) 적재.
+def _ingest_submissions(submissions: list[dict]) -> dict:
+    """파싱된 제출물 레코드를 메모리 데이터셋에 Smart Append하고 세션 DB에 동기화한다.
 
-    Smart Append: 기존에 로드되어 작업 중인 레코드는 절대 덮어쓰지 않는다.
-    학번(없으면 이름) 기준으로 중복 학생은 무시하고 신규 학생만 Append한 뒤
-    활성 프로젝트의 session.json에 즉시 동기화한다. 이후 분석 파이프라인은
-    폴더를 다시 뒤지지 않고 이 메모리 데이터셋만 순회한다.
+    기존에 로드되어 작업 중인 레코드는 절대 덮어쓰지 않는다. 학번(없으면 이름)
+    기준으로 중복 학생은 무시하고 신규 학생만 Append한 뒤 활성 프로젝트 세션(DB)에
+    즉시 저장한다. 이후 분석 파이프라인은 파일을 다시 읽지 않고 이 메모리
+    데이터셋만 순회한다.
     """
-    _require_active_project()
-    with state_lock:
-        if _pipeline_busy():
-            raise HTTPException(status_code=400, detail="분석이 진행 중일 때는 데이터를 가져올 수 없습니다. 먼저 정지해 주세요.")
-
-    path = (req.path or "").strip()
-    if not path:
-        raise HTTPException(status_code=400, detail="가져올 파일 또는 폴더 경로를 지정해 주세요.")
-
-    submissions = read_submissions(path)
-    if not submissions:
-        raise HTTPException(status_code=404, detail="지원되는 제출물을 찾지 못했습니다. (지원 형식: Excel, CSV, PDF, TXT, DOCX)")
-
-    # 메타데이터(docx)는 가져오기 시점에 1회만 추출 — 파이프라인은 파일을 다시 읽지 않는다.
-    for sub in submissions:
-        sanitize_student_identity(sub)
-        sub["filename"] = sub["student"]
-        if sub.get("file_type") == "docx":
-            try:
-                sub["metadata"] = extract_docx_metadata(sub["file_path"])
-            except Exception as e:
-                logger.warning(f"docx 메타데이터 추출 실패({sub.get('file_path')}): {e}")
-                sub["metadata"] = None
-        else:
-            sub["metadata"] = None
-
     with state_lock:
         existing_keys = {student_dedupe_key(r) for r in analysis_state["results"]}
         added = []
@@ -1053,7 +912,7 @@ def import_data(req: DataImportRequest, user: dict = Depends(get_current_user)):
 
     # [Data Sanitization — Zero-Token] 데이터 로드 시점에 도서 메타데이터를 확정한다.
     # 1) '도서명(저자명)' 복합 텍스트를 즉시 분리하고,
-    # 2) 저자가 여전히 없는 도서는 네이버 책 검색 API(.env 키)로 공식 저자를 조회한다.
+    # 2) 저자가 여전히 없는 도서는 네이버 책 검색 API로 공식 저자를 조회한다.
     # added의 각 원소는 analysis_state["results"] 내 동일 dict 객체이므로 스냅샷 저장에 그대로 반영된다.
     naver_author_memo: dict[str, str] = {}
     naver_resolved = 0
@@ -1076,8 +935,91 @@ def import_data(req: DataImportRequest, user: dict = Depends(get_current_user)):
     msg = f"데이터 가져오기 완료: 신규 {len(added)}명 추가, 중복 {skipped}명 무시 (총 {len(snapshot)}명 적재)"
     if naver_resolved:
         msg += f" / 네이버 책 검색으로 저자 확정 {naver_resolved}건 (토큰 0)"
-    add_log(f"📥 [Smart Append] {msg} — session_progress.json 동기화 완료.")
+    add_log(f"📥 [Smart Append] {msg} — 프로젝트 세션 DB 동기화 완료.")
     return {"message": msg, "added": len(added), "skipped": skipped, "total": len(snapshot)}
+
+
+@app.post("/api/data/upload")
+async def upload_data(files: list[UploadFile] = File(...), user: dict = Depends(get_current_user)):
+    """[데이터 가져오기] 브라우저에서 업로드된 제출물 파일들을 파싱해 메모리 데이터셋에 적재한다.
+
+    <input type="file" multiple> 및 폴더 업로드(webkitdirectory)로 전송된
+    multipart 파일들을 받는다. 각 파일은 원본 파일명을 유지한 채 임시 디렉토리에
+    기록된 뒤 기존 경로 기반 파서(read_submissions)로 파싱된다 — 파일명에서
+    학생/도서명을 추출(_parse_filename)하므로 파일명 보존이 필수다.
+    파싱 직후 임시 파일은 즉시 삭제된다 (서버리스 /tmp 호환).
+    """
+    _require_active_project()
+    with state_lock:
+        if _pipeline_busy():
+            raise HTTPException(status_code=400, detail="분석이 진행 중일 때는 데이터를 가져올 수 없습니다. 먼저 정지해 주세요.")
+
+    if not files:
+        raise HTTPException(status_code=400, detail="업로드된 파일이 없습니다. 파일 또는 폴더를 선택해 주세요.")
+
+    submissions: list[dict] = []
+    unsupported = 0   # 폴더 업로드에 섞여 들어온 미지원 형식 (이미지 등) — 조용히 제외
+    failed: list[str] = []
+
+    for uf in files:
+        # 업로드 파일명에서 경로 성분 제거 (webkitdirectory는 상대 경로를 포함할 수 있음)
+        filename = os.path.basename((uf.filename or "").replace("\\", "/")).strip()
+        ext = os.path.splitext(filename)[1].lower()
+        if not filename or ext not in _SUPPORTED_UPLOAD_EXTS:
+            unsupported += 1
+            continue
+
+        try:
+            raw = await uf.read()
+        finally:
+            await uf.close()
+        if not raw:
+            failed.append(filename)
+            continue
+
+        tmp_dir = tempfile.mkdtemp(prefix="ai_screening_upload_")
+        tmp_path = os.path.join(tmp_dir, filename)
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(raw)
+            subs = read_submissions(tmp_path)
+            if not subs:
+                failed.append(filename)
+            # 메타데이터(docx)는 가져오기 시점에 1회만 추출 — 파이프라인은 파일을 다시 읽지 않는다.
+            for sub in subs:
+                sanitize_student_identity(sub)
+                sub["filename"] = sub["student"]
+                if sub.get("file_type") == "docx":
+                    try:
+                        sub["metadata"] = extract_docx_metadata(tmp_path)
+                    except Exception as e:
+                        logger.warning(f"docx 메타데이터 추출 실패({filename}): {e}")
+                        sub["metadata"] = None
+                else:
+                    sub["metadata"] = None
+                # 임시 파일은 이 응답 직후 삭제되므로 레코드에 경로를 남기지 않는다
+                sub["file_path"] = ""
+            submissions.extend(subs)
+        except Exception as e:
+            logger.error(f"업로드 파일 파싱 실패({filename}): {e}")
+            failed.append(filename)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if not submissions:
+        detail = "업로드된 파일에서 지원되는 제출물을 찾지 못했습니다. (지원 형식: Excel, CSV, PDF, TXT, DOCX)"
+        if failed:
+            detail += f" / 읽기 실패: {', '.join(failed[:5])}{' 외' if len(failed) > 5 else ''}"
+        raise HTTPException(status_code=404, detail=detail)
+
+    result = _ingest_submissions(submissions)
+    if unsupported:
+        result["message"] += f" / 미지원 형식 {unsupported}개 제외"
+    if failed:
+        result["message"] += f" / 읽기 실패 {len(failed)}개 ({', '.join(failed[:5])}{' 외' if len(failed) > 5 else ''})"
+    result["unsupported"] = unsupported
+    result["failed"] = len(failed)
+    return result
 
 # -------------------------------------------------------------
 # 학생 레코드 수동 CRUD API (메모리 상태 + 세션 파일 즉시 영속화)
@@ -1221,7 +1163,7 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
             raise Exception(f"3단계 사실 검증을 위한 {req.verify_provider} API Key가 등록되지 않았습니다.")
 
         # [Data Ingestion 분리] 파이프라인은 더 이상 폴더/파일을 직접 읽지 않는다.
-        # [데이터 가져오기](POST /api/data/import)·[학생 수동 추가](POST /api/students)로
+        # [데이터 가져오기](POST /api/data/upload)·[학생 수동 추가](POST /api/students)로
         # 적재된 analysis_state["results"] 인메모리 데이터셋만을 대상으로 순회(Iterate)한다.
         # 아래 submissions의 각 원소는 analysis_state["results"]와 '동일한 dict 객체'이므로
         # 이후 단계별 in-place 갱신이 별도 재대입 없이 UI(/api/results)에 즉시 반영된다.

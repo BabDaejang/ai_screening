@@ -5,7 +5,7 @@
 ## 아키텍처 요약
 
 | 구버전 (로컬 파일) | 신버전 (클라우드) |
-|---|---|
+| --- | --- |
 | `~/.ai_screening/profiles.yaml` (프로필명만, 비밀번호 없음) | `users` 테이블 — username + **bcrypt 해시 비밀번호** |
 | `.env`의 평문 LLM API 키 | `users.encrypted_api_keys` — **Fernet(AES) 암호화** 저장, 호출 직전 복호화 |
 | `data/projects/{profile}/{id}/session.json` | `projects` 테이블 (세션 스냅샷 jsonb) |
@@ -27,7 +27,7 @@
 `.env.example`을 참고하여 설정합니다.
 
 | 변수 | 설명 |
-|---|---|
+| --- | --- |
 | `SUPABASE_URL` | Supabase 프로젝트 URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | service_role 키 |
 | `ENCRYPTION_KEY` | Fernet 마스터 키 — API 키 암호화 + 세션 토큰 서명에 사용 |
@@ -35,6 +35,7 @@
 | `NAVER_CLIENT_ID/SECRET` | (선택) 저자 자동 확정용 서버 공용 키 |
 
 `ENCRYPTION_KEY` 생성:
+
 ```bash
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
@@ -64,13 +65,14 @@ python screen.py login           # CLI 로그인 (토큰: ~/.ai_screening/cli_to
 python screen.py ./submissions/  # 분석 실행
 ```
 
-## 5. 알려진 서버리스 제약 (로컬 전용 기능)
+## 5. 알려진 서버리스 제약
 
-Vercel 서버리스 환경에서는 아래 기능이 동작하지 않거나 제한됩니다:
+파일 선택은 브라우저 업로드 방식으로 전환되어 로컬/클라우드에서 동일하게 동작합니다:
 
-- **`/api/pick-folder`, `/api/pick-file`, `/api/data/import`(경로 기반)**: 서버 로컬 파일시스템/tkinter에
-  의존하므로 클라우드에서는 사용 불가. 클라우드에서는 CSV 업로드(`/api/import`)·세션 업로드·학생 수동
-  추가를 사용하세요.
+- **제출물 가져오기**: `<input type="file">`(다중 선택) 및 폴더 업로드(webkitdirectory) →
+  `POST /api/data/upload` (multipart). 구버전의 tkinter 네이티브 다이얼로그(`/api/pick-folder`,
+  `/api/pick-file`)와 경로 기반 `/api/data/import`는 완전히 제거되었습니다.
+  서버 로컬 경로 일괄 분석이 필요하면 CLI(`python screen.py ./submissions/`)를 사용하세요.
 - **장시간 분석 파이프라인**: 백그라운드 스레드 + 단계 게이트(수 분~수십 분 대기) 구조는 서버리스
   함수의 실행 시간 제한(기본 10~60초, Pro 최대 수분)을 초과할 수 있습니다. 대규모 배치 분석은
   로컬 실행(`python app.py` 또는 CLI)을 권장하며, 완전한 클라우드 전환에는 파이프라인의
