@@ -6,9 +6,7 @@ import csv
 import io
 import json
 import logging
-import math
 import os
-import random
 import re
 import threading
 import time
@@ -32,7 +30,15 @@ from utils.session_store import (
     load_session_progress,
     parse_session_payload,
     session_file_info,
-    SESSION_FILE_PATH,
+    create_project,
+    list_projects,
+    delete_project,
+    set_active_project,
+    clear_active_project,
+    get_active_project,
+    active_project_dir,
+    active_session_path,
+    migrate_legacy_session,
 )
 from providers import create_provider
 from stages.stage1_rules import run_stage1
@@ -57,12 +63,6 @@ analysis_state = {
     "stage3_selection": None,  # awaiting_stage3_selection 상태에서 듀얼 패널 모달용 후보 페이로드
     # JIT 팩트시트(Cache Miss) 생성 중인 도서명 — UI 로딩 스피너 "'{도서명}' 팩트시트 신규 생성 중..." 표시용
     "factsheet_generating": None,
-    # Phase 1.5(마이크로 배치 선제 생성) 진행 정보: {"total": n, "done": k, "current": 도서명|None}
-    "prefetch": None,
-    # Phase 1.5 사전 생성 '사용자 승인 제안' 페이로드 (Token Control):
-    # {"missing_total": X, "sample_size": Y, "estimated_tokens": n} | None
-    # 사용자가 [예, 사전 작업 진행]을 명시적으로 클릭하기 전까지 LLM은 절대 호출되지 않는다.
-    "prefetch_offer": None,
 }
 
 # 락 객체 및 실행 제어 이벤트
@@ -79,12 +79,6 @@ phase_gate_event = threading.Event()
 # 3단계 사용자 주도형 대상 선택 게이트 (듀얼 패널 모달의 [최종 검증 확정]이 해제)
 stage3_selection_event = threading.Event()
 stage3_selected = {"keys": None}  # 사용자가 확정한 학생 키 목록
-
-# Phase 1.5 사전 생성 잡 홀더 (Token Control — 명시적 사용자 동의 게이트):
-# 파이프라인은 실행 준비된 클로저만 "run"에 적재하고 스레드를 절대 스스로 기동하지 않는다.
-# 스레드 기동(=LLM 호출 개시)은 오직 POST /api/analyze/prefetch-decision(accept=true)
-# 엔드포인트, 즉 사용자의 [예, 사전 작업 진행] onClick 이벤트 핸들러에서만 발생한다.
-prefetch_job = {"run": None, "thread": None}
 
 # 단계별 명칭 (Task 5 게이팅 UI에 표시)
 _PHASE_LABELS = {
@@ -366,7 +360,19 @@ def parse_book_title_author(raw_title: Optional[str]) -> tuple[str, Optional[str
 # 2단계 스크리닝 결과 Append-Only 영속화 & 체크포인트-재개(Resume) 엔진
 # (screening_results.jsonl)
 # -------------------------------------------------------------
-RESULTS_JSONL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screening_results.jsonl")
+# [폐기] 구버전 글로벌 체크포인트 경로 — 활성 프로젝트가 없을 때의 폴백으로만 사용
+_LEGACY_RESULTS_JSONL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screening_results.jsonl")
+
+def RESULTS_JSONL_PATH_current() -> str:
+    """체크포인트(jsonl) 경로: 활성 프로젝트 폴더 내에 프로젝트별로 격리 저장한다.
+
+    프로젝트마다 독립된 체크포인트를 가지므로 서로 다른 프로젝트의
+    동명 학생이 잘못 스킵(Resume)되는 교차 오염이 발생하지 않는다.
+    """
+    d = active_project_dir()
+    if d:
+        return os.path.join(d, "screening_results.jsonl")
+    return _LEGACY_RESULTS_JSONL_PATH
 
 def load_completed_results() -> dict:
     """screening_results.jsonl을 스캔하여 이미 완료된 [학번_성명] 인덱스를 로드합니다.
@@ -376,10 +382,11 @@ def load_completed_results() -> dict:
     중복 API 호출과 토큰 낭비를 원천 차단합니다.
     """
     completed: dict = {}
-    if not os.path.exists(RESULTS_JSONL_PATH):
+    jsonl_path = RESULTS_JSONL_PATH_current()
+    if not os.path.exists(jsonl_path):
         return completed
     try:
-        with open(RESULTS_JSONL_PATH, "r", encoding="utf-8") as f:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
             for line_no, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
@@ -403,7 +410,9 @@ def append_screening_result(result: dict):
     강제 종료하더라도 이미 완료된 데이터는 유실되지 않도록 보장합니다.
     """
     try:
-        with open(RESULTS_JSONL_PATH, "a", encoding="utf-8") as f:
+        jsonl_path = RESULTS_JSONL_PATH_current()
+        os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+        with open(jsonl_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(result, ensure_ascii=False, default=str) + "\n")
             f.flush()
             os.fsync(f.fileno())
@@ -931,6 +940,113 @@ if selected:
 
 
 # -------------------------------------------------------------
+# 다중 프로젝트(Workspace) 관리 API
+# 저장 구조: data/projects/{profile_name}/{project_id}/session.json
+# -------------------------------------------------------------
+class ProjectCreateRequest(BaseModel):
+    name: Optional[str] = None
+
+def _require_login_profile() -> str:
+    current = global_user_manager.get_current_profile()
+    if not current:
+        raise HTTPException(status_code=401, detail="먼저 로그인해야 프로젝트를 관리할 수 있습니다.")
+    return current
+
+def _require_active_project() -> dict:
+    """데이터 조작/분석 전 활성 프로젝트 존재를 강제하는 Guard Clause."""
+    active = get_active_project()
+    if not active:
+        raise HTTPException(
+            status_code=400,
+            detail="활성 프로젝트가 없습니다. [프로젝트 대시보드]에서 프로젝트를 선택(이어하기)하거나 새로 생성해 주세요.",
+        )
+    return active
+
+@app.get("/api/projects")
+def api_list_projects():
+    """현재 로그인 프로필의 프로젝트 목록(요약 정보 포함)을 반환한다.
+
+    구버전 단일 session_progress.json이 남아있으면 최초 1회 프로젝트로 자동 이관한다.
+    """
+    profile = _require_login_profile()
+    migrated = migrate_legacy_session(profile)
+    active = get_active_project()
+    return {
+        "projects": list_projects(profile),
+        "active_project_id": active["project_id"] if active and active.get("profile") == profile else None,
+        "migrated": migrated,
+    }
+
+@app.post("/api/projects")
+def api_create_project(req: ProjectCreateRequest):
+    """새 프로젝트 생성 (초기화된 빈 세션 파일 기록). 활성화는 별도 activate 호출."""
+    profile = _require_login_profile()
+    name = (req.name or "").strip() or time.strftime("검토 프로젝트 %Y-%m-%d %H:%M")
+    try:
+        meta = create_project(profile, name)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"프로젝트 생성 실패: {e}")
+    return {"message": f"프로젝트 '{name}' 생성 완료", "project": meta}
+
+@app.post("/api/projects/{project_id}/activate")
+def api_activate_project(project_id: str):
+    """프로젝트를 '현재 활성 프로젝트'로 지정하고 세션 데이터를 메모리로 로드한다."""
+    profile = _require_login_profile()
+    with state_lock:
+        if _pipeline_busy():
+            raise HTTPException(status_code=400, detail="분석이 진행 중일 때는 프로젝트를 전환할 수 없습니다. 먼저 정지해 주세요.")
+
+    data = load_session_progress(profile, project_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="프로젝트 세션 파일을 찾을 수 없거나 손상되었습니다.")
+
+    meta = data.get("project") or {}
+    set_active_project(profile, project_id, name=meta.get("name") or project_id,
+                       created_at=meta.get("created_at") or "")
+
+    results = data.get("results", [])
+    # 학번 '.0' 꼬리표 마이그레이션 (구버전 데이터 호환)
+    migrated_count = sum(1 for r in results if sanitize_student_identity(r))
+
+    with state_lock:
+        analysis_state["results"] = results
+        analysis_state["cost_summary"] = data.get("cost_summary", {})
+        analysis_state["status"] = "idle"
+        analysis_state["error_message"] = ""
+        analysis_state["logs"] = []
+
+    if migrated_count:
+        save_session_progress(results, data.get("cost_summary"), status="migrated")
+
+    add_log(f"📂 프로젝트 활성화: '{meta.get('name') or project_id}' — 학생 {len(results)}명 로드 (저장 시각: {data.get('saved_at', '미상')})")
+    return {
+        "message": f"프로젝트 '{meta.get('name') or project_id}' 활성화 완료",
+        "project": {"project_id": project_id, "name": meta.get("name") or project_id},
+        "total": len(results),
+    }
+
+@app.delete("/api/projects/{project_id}")
+def api_delete_project(project_id: str):
+    """프로젝트 폴더(세션·체크포인트 포함)를 완전히 삭제한다."""
+    profile = _require_login_profile()
+    active = get_active_project()
+    is_active_target = bool(active and active.get("project_id") == project_id)
+    with state_lock:
+        if is_active_target and _pipeline_busy():
+            raise HTTPException(status_code=400, detail="분석이 진행 중인 활성 프로젝트는 삭제할 수 없습니다. 먼저 정지해 주세요.")
+
+    if not delete_project(profile, project_id):
+        raise HTTPException(status_code=404, detail="해당 프로젝트를 찾을 수 없습니다.")
+
+    # 활성 프로젝트를 삭제한 경우: 비활성화 + 메모리 데이터셋 초기화
+    if is_active_target:
+        clear_active_project()
+        with state_lock:
+            analysis_state["results"] = []
+            analysis_state["cost_summary"] = {}
+    return {"message": "프로젝트 삭제 완료", "deactivated": is_active_target}
+
+# -------------------------------------------------------------
 # Data Ingestion API — 파일 읽기를 파이프라인에서 완전히 분리 (DB형 메모리 상태 관리)
 # -------------------------------------------------------------
 class DataImportRequest(BaseModel):
@@ -942,9 +1058,10 @@ def import_data(req: DataImportRequest):
 
     Smart Append: 기존에 로드되어 작업 중인 레코드는 절대 덮어쓰지 않는다.
     학번(없으면 이름) 기준으로 중복 학생은 무시하고 신규 학생만 Append한 뒤
-    session_progress.json에 즉시 동기화한다. 이후 분석 파이프라인은 폴더를
-    다시 뒤지지 않고 이 메모리 데이터셋만 순회한다.
+    활성 프로젝트의 session.json에 즉시 동기화한다. 이후 분석 파이프라인은
+    폴더를 다시 뒤지지 않고 이 메모리 데이터셋만 순회한다.
     """
+    _require_active_project()
     with state_lock:
         if _pipeline_busy():
             raise HTTPException(status_code=400, detail="분석이 진행 중일 때는 데이터를 가져올 수 없습니다. 먼저 정지해 주세요.")
@@ -1043,6 +1160,7 @@ def _persist_results_snapshot():
 @app.post("/api/students")
 def create_student(req: StudentCreateRequest):
     """[학생 수동 추가] 파일 없이 텍스트 복붙으로 학생 1명을 메모리 데이터셋에 추가한다."""
+    _require_active_project()
     student_id = strip_float_tail(req.student_id or "")
     student_name = (req.student_name or "").strip()
     text = (req.text or "").strip()
@@ -1078,6 +1196,7 @@ def create_student(req: StudentCreateRequest):
 @app.put("/api/students/{student_key}")
 def update_student(student_key: str, req: StudentUpdateRequest):
     """[수정] 학생 레코드의 학번/이름/도서명/본문을 갱신한다 (student_key = '학번_이름' 복합키)."""
+    _require_active_project()
     with state_lock:
         if _pipeline_busy():
             raise HTTPException(status_code=400, detail="분석이 진행 중일 때는 학생 정보를 수정할 수 없습니다.")
@@ -1111,7 +1230,8 @@ def update_student(student_key: str, req: StudentUpdateRequest):
 
 @app.delete("/api/students/{student_key}")
 def delete_student(student_key: str):
-    """[삭제] 학생 레코드를 메모리 데이터셋과 세션 파일에서 제거한다."""
+    """[삭제] 학생 레코드를 메모리 데이터셋과 활성 프로젝트 세션 파일에서 제거한다."""
+    _require_active_project()
     with state_lock:
         if _pipeline_busy():
             raise HTTPException(status_code=400, detail="분석이 진행 중일 때는 학생을 삭제할 수 없습니다.")
@@ -1283,77 +1403,9 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                 book_author_map[book_title] = author
                 return author
 
-            # -----------------------------------------------------------------
-            # Step B (Phase 1.5 — Micro-Batch Pre-computation, Opt-In)
-            # 1단계 완료 직후, 고유 도서(Unique Books) 중 book_cache.json에 없는
-            # 캐시 미스분만 추려 '무작위 약 10% (최소 1~2권)' 샘플을 준비한다.
-            # [Token Control] 여기서는 어떤 LLM 호출도 하지 않는다. 실행 준비된
-            # 클로저를 prefetch_job["run"]에 적재하고 UI에 승인 제안(prefetch_offer)만
-            # 게시할 뿐이며, 실제 생성(토큰 소모)은 사용자가 [예, 사전 작업 진행]
-            # 버튼을 클릭(POST /api/analyze/prefetch-decision)했을 때만 시작된다.
-            # [아니오]를 누르거나 무시하면 사전 작업 없이 대기 상태가 유지되고,
-            # 누락 도서는 전부 검증 시점 JIT 생성으로 처리된다.
-            # -----------------------------------------------------------------
-            prefetch_job["run"] = None
-            prefetch_job["thread"] = None
-            if not req.no_verify:
-                unique_titles = sorted({r["book_title"] for r in new_results if r.get("book_title")})
-                with book_cache_lock:
-                    missing_titles = [
-                        t for t in unique_titles
-                        if not find_cached_book_entry_by_title(t, book_cache)
-                    ]
-                cached_count = len(unique_titles) - len(missing_titles)
-
-                if missing_titles:
-                    sample_size = min(len(missing_titles), max(2, math.ceil(len(missing_titles) * 0.10)))
-                    sampled_titles = random.sample(missing_titles, sample_size)
-                    # 도서 1권당 평균 토큰 추정치: 팩트시트 생성 입력 ~500 + 출력 ~1500
-                    # (stages/stage3_verify.py estimate_cost의 추정 상수와 동일 기준)
-                    estimated_tokens = sample_size * 2000
-
-                    def _prefetch_micro_batch():
-                        # 사용자 승인 후에만 이 스레드가 기동된다. provider 생성도
-                        # 승인 이전에는 수행하지 않도록 클로저 내부로 지연시켰다.
-                        provider_prefetch = create_provider(
-                            provider_name=req.verify_provider,
-                            api_key=verify_key,
-                            model_screening="",  # 사용되지 않음
-                            model_verify=req.verify_model,
-                            cost_tracker=cost_tracker
-                        )
-                        done = 0
-                        for title in sampled_titles:
-                            if stop_event.is_set():
-                                break
-                            with state_lock:
-                                analysis_state["prefetch"] = {"total": sample_size, "done": done, "current": title}
-                            try:
-                                author = _resolve_author(title)
-                                ensure_book_factsheet_cached(
-                                    title, author, provider_prefetch,
-                                    book_cache, factsheets_dir, req.no_web,
-                                )
-                            except Exception as ex:
-                                logger.error(f"[Phase 1.5 선제생성] 도서 '{title}' 실패 (계속 진행): {ex}")
-                            done += 1
-                        with state_lock:
-                            analysis_state["prefetch"] = {"total": sample_size, "done": done, "current": None}
-                        add_log(f"📚 [Phase 1.5] 마이크로 배치 선제 생성 완료 ({done}/{sample_size}권).")
-
-                    prefetch_job["run"] = _prefetch_micro_batch
-                    with state_lock:
-                        analysis_state["prefetch_offer"] = {
-                            "missing_total": len(missing_titles),
-                            "sample_size": sample_size,
-                            "estimated_tokens": estimated_tokens,
-                        }
-                    add_log(
-                        f"📚 [Phase 1.5] 팩트시트 누락 도서 {len(missing_titles)}권 감지 (전체 고유 도서 {len(unique_titles)}종 중 캐시 보유 {cached_count}종). "
-                        f"무작위 {sample_size}권 사전 생성 여부를 묻는 승인 창을 표시합니다 — 사용자가 [예]를 누르기 전까지 토큰 소모 0."
-                    )
-                elif unique_titles:
-                    add_log(f"📚 [Phase 1.5] 고유 도서 {len(unique_titles)}종 전부 캐시 보유 — 선제 생성 불필요 (토큰 0).")
+            # [Zero-Prefetch] 사전 생성(Phase 1.5) 로직은 완전히 제거되었다.
+            # 모든 팩트시트는 3단계 검증 중 해당 도서가 등장하는 시점에만
+            # Cache Hit/Miss 판정을 거쳐 1권 단위 JIT로 확보된다.
 
             # Step A 정지선(Breakpoint): 1단계(토큰 비소비, 규칙 기반)가 전수 완료되어
             # 결과 리스트가 전부 렌더링된 뒤 명시적으로 정지한다. 사용자가 [다음 단계 진행]
@@ -1465,16 +1517,6 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                     cost_tracker=cost_tracker
                 )
 
-                # Phase 1.5 선제 생성(사용자 승인으로 기동된 경우)이 아직 끝나지 않았다면
-                # 완료를 기다린다 (book_cache 동시 쓰기 경합 방지 — 통상 이미 종료됨).
-                prefetch_thread = prefetch_job.get("thread")
-                if prefetch_thread is not None and prefetch_thread.is_alive():
-                    add_log("⏳ [Phase 1.5] 백그라운드 선제 생성 마무리 대기 중...")
-                    while prefetch_thread.is_alive():
-                        if stop_event.is_set():
-                            raise Exception("사용자에 의해 분석이 강제 종료되었습니다.")
-                        prefetch_thread.join(timeout=1.0)
-
                 def _ensure_factsheet_jit(book_title: str) -> Optional[str]:
                     """Step C (Just-In-Time Evaluation): run_stage3가 검증 도중 해당 도서를
                     '만나는 시점'에만 호출한다.
@@ -1585,12 +1627,10 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
             analysis_state["step"] = "분석 완료"
             analysis_state["results"] = results
             analysis_state["cost_summary"] = cost_summary
-            analysis_state["prefetch_offer"] = None
-        prefetch_job["run"] = None
 
         # 최종 세션 스냅샷 저장 (State Portability — 타 PC에서 이어하기 가능)
         save_session_progress(results, cost_summary, status="completed")
-        add_log(f"💾 세션 진행 상태 저장 완료: {SESSION_FILE_PATH}")
+        add_log(f"💾 프로젝트 세션 저장 완료: {active_session_path() or '(활성 프로젝트 없음)'}")
 
         add_log("🎉 전체 파이프라인 분석이 성공적으로 끝났습니다!")
         
@@ -1605,8 +1645,6 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                 analysis_state["status"] = "error"
                 analysis_state["error_message"] = str(e)
                 analysis_state["step"] = "에러 발생"
-            analysis_state["prefetch_offer"] = None
-        prefetch_job["run"] = None
         add_log(f"❌ 에러가 발생했습니다: {e}")
 
 @app.post("/api/analyze")
@@ -1617,7 +1655,10 @@ def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks):
     session_data = global_user_manager.get_session_data()
     if not session_data:
         raise HTTPException(status_code=401, detail="먼저 로그인하셔야 분석을 돌릴 수 있습니다.")
-        
+
+    # 분석 결과는 활성 프로젝트의 session.json에 영속화되므로 활성 프로젝트가 필수다.
+    _require_active_project()
+
     with state_lock:
         if analysis_state["status"] == "running":
             raise HTTPException(status_code=400, detail="이미 다른 분석이 진행 중입니다.")
@@ -1634,15 +1675,11 @@ def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks):
         analysis_state["awaiting_phase"] = None
         analysis_state["stage3_selection"] = None
         analysis_state["factsheet_generating"] = None
-        analysis_state["prefetch"] = None
-        analysis_state["prefetch_offer"] = None
         stop_event.clear()
         pause_event.set()
         phase_gate_event.clear()
         stage3_selection_event.clear()
         stage3_selected["keys"] = None
-        prefetch_job["run"] = None
-        prefetch_job["thread"] = None
 
     config = load_config()
     
@@ -1693,47 +1730,8 @@ def next_phase_analysis():
     with state_lock:
         if analysis_state["status"] != "awaiting_phase":
             raise HTTPException(status_code=400, detail="현재 다음 단계로 진행할 수 있는 대기 상태가 아닙니다.")
-        # 아직 응답하지 않은 사전 생성 승인 제안은 암묵적 거절로 처리하고 폐기한다.
-        # (이미 승인되어 실행 중인 스레드는 영향 없음 — 3단계 진입 전 join으로 수렴)
-        analysis_state["prefetch_offer"] = None
-    prefetch_job["run"] = None
     phase_gate_event.set()
     return {"message": "다음 단계 진행 요청 완료"}
-
-class PrefetchDecisionRequest(BaseModel):
-    accept: bool
-
-@app.post("/api/analyze/prefetch-decision")
-def decide_prefetch(req_body: PrefetchDecisionRequest):
-    """[Token Control — Trigger Isolation] Phase 1.5 사전 생성(LLM 토큰 소모)은
-    렌더링/폴링 사이클이 아니라 오직 이 엔드포인트, 즉 사용자의
-    [예, 사전 작업 진행] 버튼 onClick 이벤트에서만 발화된다.
-
-    - accept=true : 준비된 마이크로 배치 클로저를 백그라운드 스레드로 기동.
-    - accept=false: 제안 폐기 — 사전 작업 없이 대기 상태 유지, 누락 도서는 전부 JIT 처리.
-    """
-    with state_lock:
-        offer = analysis_state.get("prefetch_offer")
-        if analysis_state["status"] != "awaiting_phase" or not offer:
-            raise HTTPException(status_code=400, detail="현재 사전 작업 승인 대기 상태가 아닙니다.")
-        # 제안을 즉시 소거하여 중복 클릭(이중 기동)을 방지한다.
-        analysis_state["prefetch_offer"] = None
-
-    job = prefetch_job.get("run")
-    prefetch_job["run"] = None
-
-    if not req_body.accept:
-        add_log("⏭️ 사용자가 사전 생성을 건너뛰었습니다 — 누락 도서는 검증 시점에 1권 단위 JIT 생성됩니다 (대기 상태 유지, 토큰 소모 0).")
-        return {"message": "사전 작업 없이 대기 상태를 유지합니다.", "started": False}
-
-    if job is None:
-        raise HTTPException(status_code=400, detail="사전 작업이 이미 시작되었거나 더 이상 유효하지 않습니다.")
-
-    thread = threading.Thread(target=job, daemon=True)
-    prefetch_job["thread"] = thread
-    thread.start()
-    add_log(f"✅ 사용자 승인 완료 — Phase 1.5 마이크로 배치 선제 생성 {offer['sample_size']}권을 백그라운드에서 시작합니다.")
-    return {"message": f"사전 생성 {offer['sample_size']}권 시작", "started": True}
 
 class Stage3SelectionRequest(BaseModel):
     students: list[str]
@@ -1861,10 +1859,6 @@ def get_analysis_status():
             "stage3_selection": analysis_state.get("stage3_selection"),
             # Cache Miss로 JIT 생성 중인 도서명 (UI 스피너 "'{도서명}' 팩트시트 신규 생성 중...")
             "factsheet_generating": analysis_state.get("factsheet_generating"),
-            # Phase 1.5 마이크로 배치 선제 생성 진행 정보
-            "prefetch": analysis_state.get("prefetch"),
-            # Phase 1.5 사전 생성 승인 제안 (사용자가 [예/아니오]를 선택하기 전까지 유지)
-            "prefetch_offer": analysis_state.get("prefetch_offer"),
         }
 
 @app.get("/api/results")
@@ -2053,22 +2047,23 @@ def get_session_info():
 @app.get("/api/session/download")
 def download_session_file():
     """session_progress.json을 그대로 다운로드한다 (타 PC로 작업 이관용)."""
-    if not os.path.exists(SESSION_FILE_PATH):
-        raise HTTPException(status_code=404, detail="아직 저장된 세션 진행 상태 파일이 없습니다.")
-    return FileResponse(
-        SESSION_FILE_PATH,
-        media_type="application/json",
-        filename=os.path.basename(SESSION_FILE_PATH),
-    )
+    path = active_session_path()
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="활성 프로젝트의 세션 파일이 없습니다. 먼저 프로젝트를 선택해 주세요.")
+    active = get_active_project() or {}
+    download_name = f"{active.get('name') or 'project'}_session.json"
+    return FileResponse(path, media_type="application/json", filename=download_name)
 
 @app.post("/api/session/upload")
 async def upload_session_file(file: UploadFile = File(...)):
     """진행 상태 파일을 업로드하여 세션을 복원(Resume)한다.
 
     - 파일 이름이 변경되어 있어도 내용 스키마(schema/version)만 일치하면 복원된다.
-    - 완전히 처리된 학생은 screening_results.jsonl 체크포인트에 백필되어,
-      다음 분석 실행 시 자동으로 스킵된다 (중복 API 호출/토큰 소모 0).
+    - 복원된 내용은 '현재 활성 프로젝트'의 세션으로 저장된다.
+    - 완전히 처리된 학생은 활성 프로젝트의 screening_results.jsonl 체크포인트에
+      백필되어, 다음 분석 실행 시 자동으로 스킵된다 (중복 API 호출/토큰 소모 0).
     """
+    _require_active_project()
     with state_lock:
         if analysis_state["status"] in ("running", "paused", "awaiting_phase", "awaiting_stage3_selection"):
             raise HTTPException(status_code=400, detail="분석이 진행 중일 때는 세션을 복원할 수 없습니다. 먼저 정지해 주세요.")
@@ -2291,25 +2286,10 @@ global_user_manager = UserManager()
 # 마지막 session_progress.json 스냅샷이 있으면 결과 목록을 즉시 복구하여
 # 재기동 후에도 UI에서 이전 작업을 그대로 이어볼 수 있게 한다.
 # -------------------------------------------------------------
-_restored_session = load_session_progress()
-if _restored_session and _restored_session.get("results"):
-    # [마이그레이션] 기 등록된 세션 데이터의 학번/이름 '.0' 꼬리표(Excel Float 캐스팅 잔재)를
-    # 앱 기동 시 일괄 정제한다 (예: '10701.0' → '10701'). 변경분이 있으면 즉시 재저장.
-    _migrated_count = sum(
-        1 for _r in _restored_session["results"] if sanitize_student_identity(_r)
-    )
-    with state_lock:
-        analysis_state["results"] = _restored_session["results"]
-        analysis_state["cost_summary"] = _restored_session.get("cost_summary", {})
-    if _migrated_count:
-        save_session_progress(_restored_session["results"], _restored_session.get("cost_summary"), status="migrated")
-        logger.info("학번 '.0' 꼬리표 마이그레이션 완료: %d명 정제 후 세션 파일 재저장.", _migrated_count)
-    logger.info(
-        "이전 세션 자동 복원 완료: %d명 (저장 시각: %s, 파일: %s)",
-        len(_restored_session["results"]),
-        _restored_session.get("saved_at", "미상"),
-        SESSION_FILE_PATH,
-    )
+# [다중 프로젝트 아키텍처] 서버 기동 시 자동 복원은 수행하지 않는다.
+# 로그인 후 [프로젝트 대시보드]에서 프로젝트를 activate하는 시점에 해당
+# 프로젝트의 session.json이 로드된다. 구버전 단일 session_progress.json은
+# GET /api/projects 최초 조회 시 프로젝트로 자동 이관(migrate_legacy_session)된다.
 
 # 앱 실행 시 모든 프로필의 API 키를 모아 모델 캐시를 백그라운드에서 동적 갱신
 trigger_bg_refresh_all_profiles()

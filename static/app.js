@@ -125,7 +125,7 @@ document.addEventListener("DOMContentLoaded", () => {
     let stage3SelectedSet = new Set();  // 우측 패널(검증 대상)에 있는 학생 키
     let stage3ModalAutoOpened = false;   // 대기 상태 진입 시 1회 자동 오픈 플래그
     let lastPipelineStatus = "";         // btnNextPhase 클릭 분기용
-    let prefetchModalAutoOpened = false; // Phase 1.5 사전 생성 승인 모달 1회 자동 오픈 플래그
+    let activeProject = null;            // 활성 프로젝트 {project_id, name} — activate 성공 시에만 설정
     let lastGeneratingActive = false;    // 팩트시트 생성 활성 → 비활성 전환 감지용 (인벤토리 Event-Driven 갱신)
 
     // 세션 진행 상태 파일 UI (State Portability)
@@ -509,9 +509,14 @@ document.addEventListener("DOMContentLoaded", () => {
             btnAuthAction.className = "btn btn-sm btn-outline";
             
             authRequiredPanel.style.display = "none";
-            mainDashboard.style.display = "grid";
-            
-            fetchLastResults();
+            // [Workspace Flow] 로그인 직후에는 메인 분석 UI를 바로 열지 않고
+            // 프로젝트 대시보드를 먼저 보여준다. 특정 프로젝트가 activate 되었을
+            // 때만 enterWorkspace()가 메인 UI를 표시한다.
+            if (activeProject) {
+                enterWorkspace(activeProject);
+            } else {
+                showProjectDashboard();
+            }
         } else {
             indicator.className = "status-indicator offline";
             statusText.textContent = "로그인 필요";
@@ -520,7 +525,160 @@ document.addEventListener("DOMContentLoaded", () => {
 
             mainDashboard.style.display = "none";
             authRequiredPanel.style.display = "block";
+            activeProject = null;
+            const dash = document.getElementById("projectDashboard");
+            const bar = document.getElementById("workspaceBar");
+            if (dash) dash.style.display = "none";
+            if (bar) bar.style.display = "none";
         }
+    }
+
+    // -------------------------------------------------------------
+    // 다중 프로젝트(Workspace) 대시보드
+    // -------------------------------------------------------------
+    function showProjectDashboard() {
+        mainDashboard.style.display = "none";
+        const bar = document.getElementById("workspaceBar");
+        if (bar) bar.style.display = "none";
+        const dash = document.getElementById("projectDashboard");
+        if (dash) dash.style.display = "block";
+        fetchProjects();
+    }
+
+    function enterWorkspace(project) {
+        activeProject = project;
+        const dash = document.getElementById("projectDashboard");
+        if (dash) dash.style.display = "none";
+        const bar = document.getElementById("workspaceBar");
+        if (bar) bar.style.display = "flex";
+        const nameEl = document.getElementById("activeProjectName");
+        if (nameEl) nameEl.textContent = project.name || project.project_id;
+        mainDashboard.style.display = "grid";
+        // 활성 프로젝트의 데이터셋/세션 정보/도서 인벤토리를 즉시 렌더링
+        fetchLastResults();
+        fetchSessionInfo();
+        fetchBookInventory();
+    }
+
+    async function fetchProjects() {
+        const listEl = document.getElementById("projectList");
+        if (!listEl) return;
+        try {
+            const res = await fetch("/api/projects");
+            if (!res.ok) {
+                const data = await res.json();
+                listEl.innerHTML = `<p style="color: var(--text-muted);">${escapeHtml(data.detail || "프로젝트 목록을 불러오지 못했습니다.")}</p>`;
+                return;
+            }
+            const data = await res.json();
+            renderProjectList(data.projects || [], data.active_project_id);
+        } catch (err) {
+            console.error("프로젝트 목록 조회 에러:", err);
+        }
+    }
+
+    function renderProjectList(projects, activeId) {
+        const listEl = document.getElementById("projectList");
+        if (!listEl) return;
+
+        if (projects.length === 0) {
+            listEl.innerHTML = `
+                <div style="text-align: center; padding: 30px 10px; color: var(--text-muted); border: 1px dashed rgba(255,255,255,0.15); border-radius: 8px;">
+                    아직 생성된 프로젝트가 없습니다.<br>상단의 <strong>[+ 새 프로젝트 시작하기]</strong> 버튼으로 첫 검토 프로젝트를 만들어 보세요.
+                </div>`;
+            return;
+        }
+
+        listEl.innerHTML = projects.map(p => `
+            <div class="card" style="display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 14px 18px; margin: 0;">
+                <div style="min-width: 0;">
+                    <div style="font-weight: 700; font-size: 14.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                        📁 ${escapeHtml(p.name)}
+                        ${p.project_id === activeId ? '<span class="badge badge-low" style="margin-left:6px;">활성</span>' : ""}
+                        ${p.status === "corrupted" ? '<span class="badge badge-high" style="margin-left:6px;">손상</span>' : ""}
+                    </div>
+                    <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">
+                        생성: ${escapeHtml(p.created_at || "-")} · 최종 저장: ${escapeHtml(p.saved_at || "-")} · 학생 ${p.student_count}명
+                    </div>
+                </div>
+                <div style="display: flex; gap: 8px; flex-shrink: 0;">
+                    <button class="btn btn-sm btn-primary btn-project-resume" data-id="${escapeHtml(p.project_id)}">이어하기</button>
+                    <button class="btn btn-sm btn-outline btn-project-delete" data-id="${escapeHtml(p.project_id)}" data-name="${escapeHtml(p.name)}">삭제</button>
+                </div>
+            </div>
+        `).join("");
+
+        listEl.querySelectorAll(".btn-project-resume").forEach(btn => {
+            btn.addEventListener("click", () => activateProject(btn.dataset.id));
+        });
+        listEl.querySelectorAll(".btn-project-delete").forEach(btn => {
+            btn.addEventListener("click", () => removeProject(btn.dataset.id, btn.dataset.name));
+        });
+    }
+
+    async function activateProject(projectId) {
+        try {
+            const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/activate`, { method: "POST" });
+            const data = await res.json();
+            if (res.ok) {
+                enterWorkspace(data.project);
+            } else {
+                alert(`프로젝트 활성화 실패: ${data.detail || "알 수 없는 오류"}`);
+            }
+        } catch (err) {
+            console.error("프로젝트 활성화 에러:", err);
+        }
+    }
+
+    async function createNewProject() {
+        const defaultName = `검토 프로젝트 ${new Date().toLocaleDateString("ko-KR")}`;
+        const name = prompt("새 프로젝트 이름을 입력하세요:", defaultName);
+        if (name === null) return; // 취소
+        try {
+            const res = await fetch("/api/projects", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name: name.trim() })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                await activateProject(data.project.project_id); // 생성 직후 곧바로 작업 공간 진입
+            } else {
+                alert(`프로젝트 생성 실패: ${data.detail || "알 수 없는 오류"}`);
+            }
+        } catch (err) {
+            console.error("프로젝트 생성 에러:", err);
+        }
+    }
+
+    async function removeProject(projectId, name) {
+        if (!confirm(`'${name}' 프로젝트를 완전히 삭제하시겠습니까?\n(학생 데이터·분석 결과·체크포인트가 모두 삭제되며 되돌릴 수 없습니다)`)) return;
+        try {
+            const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}`, { method: "DELETE" });
+            const data = await res.json();
+            if (res.ok) {
+                if (data.deactivated) activeProject = null;
+                await fetchProjects();
+            } else {
+                alert(`프로젝트 삭제 실패: ${data.detail || "알 수 없는 오류"}`);
+            }
+        } catch (err) {
+            console.error("프로젝트 삭제 에러:", err);
+        }
+    }
+
+    const btnCreateProject = document.getElementById("btnCreateProject");
+    if (btnCreateProject) {
+        btnCreateProject.addEventListener("click", createNewProject);
+    }
+    const btnBackToProjects = document.getElementById("btnBackToProjects");
+    if (btnBackToProjects) {
+        btnBackToProjects.addEventListener("click", () => {
+            if (["running", "paused", "awaiting_phase", "awaiting_stage3_selection"].includes(lastPipelineStatus)) {
+                if (!confirm("분석이 진행/대기 중입니다. 프로젝트 목록으로 나가면 화면 갱신이 중단됩니다 (백그라운드 작업은 계속됨). 나가시겠습니까?")) return;
+            }
+            showProjectDashboard();
+        });
     }
 
     // 대시보드 API 키 현황 요약
@@ -1018,8 +1176,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
             // 활성 작업 판정: LLM/무거운 연산이 실제로 돌고 있는 상태에서만 빠른 폴링 유지
             const isActiveWork = state.status === "running" || state.status === "paused";
-            const generatingNow = Boolean(state.factsheet_generating)
-                || Boolean(state.prefetch && state.prefetch.current);
+            const generatingNow = Boolean(state.factsheet_generating);
             const isWaitingGate = state.status === "awaiting_phase" || state.status === "awaiting_stage3_selection";
 
             // 3단계 대상 선택 대기 상태: 듀얼 패널 모달 초기화 및 1회 자동 오픈
@@ -1033,31 +1190,6 @@ document.addEventListener("DOMContentLoaded", () => {
                 stage3ModalAutoOpened = false;
                 if (modalStage3Select && modalStage3Select.style.display !== "none" && state.status !== "awaiting_stage3_selection") {
                     modalStage3Select.style.display = "none"; // 확정/종료 후 잔여 모달 정리
-                }
-            }
-
-            // [Token Control] Phase 1.5 사전 생성 '사용자 승인' 모달:
-            // 1단계 완료 대기 상태에서 캐시 누락 도서가 있으면 1회 자동 오픈.
-            // [예] 클릭 전까지 백엔드는 어떤 LLM도 호출하지 않는다.
-            const modalPrefetchConsent = document.getElementById("modalPrefetchConsent");
-            if (state.status === "awaiting_phase" && state.prefetch_offer) {
-                if (!prefetchModalAutoOpened && modalPrefetchConsent) {
-                    const offer = state.prefetch_offer;
-                    const textEl = document.getElementById("prefetchConsentText");
-                    if (textEl) {
-                        textEl.innerHTML =
-                            `현재 팩트시트가 누락된 도서가 총 <strong>${offer.missing_total}권</strong> 있습니다.<br>` +
-                            `다음 단계의 빠른 처리를 위해 약 10%(<strong>${offer.sample_size}권</strong>)의 팩트시트를 미리 생성하시겠습니까?<br>` +
-                            `<span style="color: var(--text-muted); font-size: 12.5px;">(예상 소요 토큰: 약 ${Number(offer.estimated_tokens).toLocaleString()} 토큰 / ` +
-                            `승인 전까지 LLM 호출·토큰 소모 0 — 건너뛰면 검증 시점에 1권 단위로 생성됩니다)</span>`;
-                    }
-                    modalPrefetchConsent.style.display = "flex";
-                    prefetchModalAutoOpened = true;
-                }
-            } else {
-                prefetchModalAutoOpened = false;
-                if (modalPrefetchConsent && modalPrefetchConsent.style.display !== "none") {
-                    modalPrefetchConsent.style.display = "none"; // 결정/단계 전환 후 잔여 모달 정리
                 }
             }
 
@@ -1396,46 +1528,6 @@ document.addEventListener("DOMContentLoaded", () => {
                 console.error("다음 단계 진행 API 에러:", err);
             }
             wakePolling(); // Event-Driven: 클릭 직후 즉시 상태 반영 (keep-alive 60초를 기다리지 않음)
-        });
-    }
-
-    // -------------------------------------------------------------
-    // Phase 1.5 사전 생성 '사용자 승인' 모달 (Token Control)
-    // 사전 생성(LLM 토큰 소모)은 아래 [예] 버튼의 onClick 핸들러에서만 발화된다.
-    // -------------------------------------------------------------
-    async function sendPrefetchDecision(accept) {
-        const modal = document.getElementById("modalPrefetchConsent");
-        try {
-            const res = await fetch("/api/analyze/prefetch-decision", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ accept })
-            });
-            if (!res.ok) {
-                const errData = await res.json();
-                alert(`요청 실패: ${errData.detail || "알 수 없는 오류"}`);
-            }
-        } catch (err) {
-            console.error("사전 생성 승인 API 에러:", err);
-        }
-        if (modal) modal.style.display = "none";
-        wakePolling(); // 승인 시 진행 상황(2초 폴링) 전환 / 거절 시 keep-alive 유지 판정을 즉시 반영
-    }
-
-    const btnPrefetchAccept = document.getElementById("btnPrefetchAccept");
-    const btnPrefetchDecline = document.getElementById("btnPrefetchDecline");
-    const btnClosePrefetchModal = document.getElementById("btnClosePrefetchModal");
-    if (btnPrefetchAccept) {
-        btnPrefetchAccept.addEventListener("click", () => sendPrefetchDecision(true));
-    }
-    if (btnPrefetchDecline) {
-        btnPrefetchDecline.addEventListener("click", () => sendPrefetchDecision(false));
-    }
-    if (btnClosePrefetchModal) {
-        // 닫기(X)는 '보류'일 뿐 — 결정 전까지 백엔드는 계속 대기하며 토큰 소모 0.
-        btnClosePrefetchModal.addEventListener("click", () => {
-            const modal = document.getElementById("modalPrefetchConsent");
-            if (modal) modal.style.display = "none";
         });
     }
 

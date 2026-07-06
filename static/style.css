@@ -483,9 +483,12 @@ body {
 .select-sm {
     padding: 6px 10px;
 }
+/* [가로 스크롤 아키텍처] 뷰포트 축소 시 테이블 우측이 잘리지 않도록
+   래퍼에서 가로 스크롤을 담당한다 (터치 관성 스크롤 포함). */
 .table-container {
     width: 100%;
     overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
     border: 1px solid var(--border-color);
     border-radius: 8px;
     background-color: rgba(0, 0, 0, 0.15);
@@ -503,6 +506,8 @@ body {
 }
 .data-table {
     width: 100%;
+    /* 뷰포트가 좁아져도 컬럼이 구겨지지 않는 하한 폭 — 초과분은 래퍼가 가로 스크롤 처리 */
+    min-width: 900px;
     border-collapse: collapse;
     font-size: 13px;
     text-align: left;
@@ -511,9 +516,16 @@ body {
     padding: 14px 18px;
 }
 .data-table th {
-    background-color: rgba(255, 255, 255, 0.02);
+    /* 세로 스크롤 래퍼(예: 도서 인벤토리) 내부에서 헤더 상단 고정.
+       overflow-x만 가진 래퍼에서는 무해하게 무시된다.
+       불투명 배경 + z-index로 스크롤되는 행 위에 항상 덮이도록 한다. */
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background-color: #141b2d;
     color: var(--text-secondary);
     font-weight: 500;
+    white-space: nowrap;
     border-bottom: 1px solid var(--border-color);
 }
 .data-table td {
@@ -1709,6 +1721,9 @@ body {
     margin: 0;
     padding: 8px;
     overflow-y: auto;
+    /* 3단계 듀얼 패널 리스트: 좁은 화면에서 뱃지/서명이 잘리지 않도록 가로 스크롤 허용 */
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
     flex: 1;
     min-height: 300px;
     max-height: 46vh;

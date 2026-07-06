@@ -52,7 +52,28 @@
             </div>
         </section>
 
-        <!-- 메인 제어 및 대시보드 (로그인 완료시 표시) -->
+        <!-- 프로젝트 대시보드 (로그인 성공 직후 첫 화면 — 특정 프로젝트 activate 전까지 메인 UI 숨김) -->
+        <section class="card" id="projectDashboard" style="display: none; max-width: 880px; margin: 0 auto; padding: 26px 30px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+                <h2 style="margin: 0; font-size: 20px;">🗂️ 프로젝트 대시보드</h2>
+                <button class="btn btn-primary" id="btnCreateProject">+ 새 프로젝트 시작하기</button>
+            </div>
+            <p class="section-desc" style="margin-top: 8px;">
+                이어서 작업할 검토 프로젝트를 선택하세요. 각 프로젝트의 학생 데이터·분석 결과·체크포인트는
+                <code>data/projects/</code> 하위에 완전히 독립적으로 저장됩니다.
+            </p>
+            <div id="projectList" style="display: flex; flex-direction: column; gap: 10px; margin-top: 16px;">
+                <!-- JS 동적 렌더링 -->
+            </div>
+        </section>
+
+        <!-- 작업 공간 상단 바: 활성 프로젝트 표시 + 대시보드 복귀 -->
+        <div id="workspaceBar" style="display: none; align-items: center; gap: 14px; margin-bottom: 16px;">
+            <button class="btn btn-sm btn-outline" id="btnBackToProjects">← 프로젝트 목록으로 돌아가기</button>
+            <span style="font-weight: 600; font-size: 14px;">📁 활성 프로젝트: <span id="activeProjectName" style="color: var(--color-primary);">-</span></span>
+        </div>
+
+        <!-- 메인 제어 및 대시보드 (프로젝트 활성화 시에만 표시) -->
         <div class="dashboard-grid" id="mainDashboard" style="display: none;">
             
             <!-- 왼쪽: API 키 관리 및 분석 실행 (원래 위치 고정) -->
@@ -611,25 +632,6 @@
                 <div class="modal-footer-actions" style="margin-top: 20px;">
                     <button class="btn btn-outline" id="btnCancelStudentForm">취소</button>
                     <button class="btn btn-primary" id="btnSubmitStudentForm">저장</button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- 5-A. Phase 1.5 팩트시트 사전 생성 '사용자 승인' 모달 (Token Control) -->
-    <div class="modal-backdrop" id="modalPrefetchConsent" style="display: none;">
-        <div class="modal card">
-            <div class="modal-header">
-                <h2>📚 팩트시트 사전 생성 승인</h2>
-                <button class="btn-close" id="btnClosePrefetchModal" title="창 닫기 (결정 전까지 토큰 소모 없이 대기합니다)">&times;</button>
-            </div>
-            <div class="modal-body">
-                <p class="modal-desc" id="prefetchConsentText">
-                    팩트시트 누락 도서 정보를 불러오는 중...
-                </p>
-                <div class="modal-footer-actions" style="margin-top: 20px;">
-                    <button class="btn btn-outline" id="btnPrefetchDecline">아니오, 바로 넘어가기</button>
-                    <button class="btn btn-primary" id="btnPrefetchAccept">예, 사전 작업 진행</button>
                 </div>
             </div>
         </div>
