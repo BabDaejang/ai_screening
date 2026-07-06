@@ -239,11 +239,21 @@ body {
     display: flex;
     flex-direction: column;
     gap: 30px;
+    /* Grid 자식의 암묵적 min-width:auto가 내부 테이블 폭만큼 축소를 거부하여
+       우측 절단을 유발하던 근본 원인 교정 — 축소를 허용해야 래퍼의
+       overflow-x 스크롤이 정상 동작한다. */
+    min-width: 0;
 }
 .column-right {
     display: flex;
     flex-direction: column;
     gap: 30px;
+    min-width: 0; /* 위와 동일 — 1fr 컬럼이 테이블 폭에 인질로 잡히지 않도록 축소 허용 */
+}
+.column-right > section,
+.column-left > section {
+    max-width: 100%;
+    min-width: 0; /* flex 자식도 동일하게 축소 허용 */
 }
 
 /* Dashboard Top Grid (Control Frame & Live Log Console) */
@@ -484,9 +494,13 @@ body {
     padding: 6px 10px;
 }
 /* [가로 스크롤 아키텍처] 뷰포트 축소 시 테이블 우측이 잘리지 않도록
-   래퍼에서 가로 스크롤을 담당한다 (터치 관성 스크롤 포함). */
+   래퍼에서 가로 스크롤을 담당한다 (터치 관성 스크롤 포함).
+   display:block + max-width:100%로 부모 Flex/Grid의 축소 강제와 무관하게
+   항상 자신의 폭 안에서 스크롤바를 생성한다. */
 .table-container {
+    display: block;
     width: 100%;
+    max-width: 100%;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     border: 1px solid var(--border-color);
@@ -514,6 +528,15 @@ body {
 }
 .data-table th, .data-table td {
     padding: 14px 18px;
+    /* 셀 내 임의 줄바꿈이 행 높이·레이아웃을 붕괴시키는 것을 방지하고,
+       초과 폭은 래퍼(.table-container)의 가로 스크롤로 처리한다. */
+    white-space: nowrap;
+}
+/* 긴 텍스트 컬럼(도서명 등)은 폭 상한 + 말줄임으로 과도한 확장 방지 */
+.data-table td.cell-ellipsis {
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 .data-table th {
     /* 세로 스크롤 래퍼(예: 도서 인벤토리) 내부에서 헤더 상단 고정.
@@ -1840,4 +1863,42 @@ body {
 }
 .data-table th.sortable:hover {
     color: var(--color-primary);
+}
+
+/* ------------------------------------------------------------------
+   [조회/관리] 액션 버튼 그룹: 세로 누적(Stacking) 금지 — 항상 가로 1줄
+   ------------------------------------------------------------------ */
+.action-btn-group {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+}
+.action-btn-group .btn {
+    padding: 4px 8px;
+    font-size: 0.85rem;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+/* ------------------------------------------------------------------
+   좌측 사이드바 파이프라인 제어 버튼 그룹 ([선별 검사 시작] 바로 하단)
+   ------------------------------------------------------------------ */
+.pipeline-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 10px;
+}
+.pipeline-controls .control-row {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.pipeline-controls .control-row .btn {
+    flex: 1;
+    min-width: 110px;
 }

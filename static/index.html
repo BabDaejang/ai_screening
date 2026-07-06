@@ -80,7 +80,12 @@
             <div class="column-left">
                 <!-- 1. 분석 실행 카드 (원래 위치) -->
                 <section class="control-panel card" id="leftControlPanel">
-                    <h3>🔍 분석 실행</h3>
+                    <!-- 제목 영역: 접기/펼치기 토글 버튼으로 필요 시 영역을 축소해 하단 정보 확보 -->
+                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px;">
+                        <h3 style="margin-bottom: 0;">🔍 분석 실행</h3>
+                        <button type="button" class="btn btn-sm btn-outline" id="btnToggleAnalysisPanel" title="분석 실행 영역 접기/펼치기">▲ 접기</button>
+                    </div>
+                    <div id="analysisPanelBody" style="margin-top: 18px;">
                     <div class="form-group">
                         <label>분석 대상 제출물 파일 선택 (Excel, CSV, PDF, TXT, DOCX)</label>
                         <div class="path-input-row">
@@ -172,6 +177,34 @@
                         </svg>
                         선별 검사 시작
                     </button>
+
+                    <!-- 파이프라인 제어 버튼 그룹: [선별 검사 시작] 바로 하단 (작업 맥락 인접 배치) -->
+                    <div class="pipeline-controls" id="pipelineControls">
+                        <div class="control-row">
+                            <button type="button" class="btn btn-warning" id="btnPauseFrame" disabled style="background-color: #f59e0b; color: #fff; border: none; padding: 10px; border-radius: 6px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 13px;">
+                                <svg id="pauseFrameIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13">
+                                    <rect x="6" y="4" width="4" height="16"></rect>
+                                    <rect x="14" y="4" width="4" height="16"></rect>
+                                </svg>
+                                <span id="pauseFrameBtnText">일시정지</span>
+                            </button>
+                            <button type="button" class="btn btn-danger" id="btnStopFrame" disabled style="background-color: var(--color-danger); color: #fff; border: none; padding: 10px; border-radius: 6px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 13px;">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13">
+                                    <rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect>
+                                </svg>
+                                강제 종료
+                            </button>
+                        </div>
+                        <!-- Task 5: 단계별 게이팅 — 이전 단계가 끝나야만 활성화됨 -->
+                        <button type="button" class="btn btn-primary btn-block" id="btnNextPhase" disabled style="padding: 10px; border-radius: 6px; font-weight: 600; font-size: 13px; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                                <polygon points="5 4 15 12 5 20 5 4"></polygon>
+                                <line x1="19" y1="5" x2="19" y2="19"></line>
+                            </svg>
+                            <span id="btnNextPhaseText">다음 단계 진행</span>
+                        </button>
+                    </div>
+                    </div> <!-- /#analysisPanelBody -->
                 </section>
 
                 <!-- 2. API 키 관리 카드 -->
@@ -240,29 +273,8 @@
                             </svg>
                             <span id="factsheetGenText">팩트시트 신규 생성 중...</span>
                         </div>
-                        <div class="center-control-actions" style="display: flex; gap: 12px; width: 100%;">
-                            <button type="button" class="btn btn-warning" id="btnPauseFrame" style="background-color: #f59e0b; color: #fff; border: none; flex: 1; padding: 10px; border-radius: 6px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 13px;">
-                                <svg id="pauseFrameIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13">
-                                    <rect x="6" y="4" width="4" height="16"></rect>
-                                    <rect x="14" y="4" width="4" height="16"></rect>
-                                </svg>
-                                <span id="pauseFrameBtnText">일시정지</span>
-                            </button>
-                            <button type="button" class="btn btn-danger" id="btnStopFrame" style="background-color: var(--color-danger); color: #fff; border: none; flex: 1; padding: 10px; border-radius: 6px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 13px;">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13">
-                                    <rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect>
-                                </svg>
-                                강제 종료
-                            </button>
-                        </div>
-                        <!-- Task 5: 단계별 게이팅 — 이전 단계가 끝나야만 활성화됨 -->
-                        <button type="button" class="btn btn-primary btn-block" id="btnNextPhase" disabled style="margin-top: 10px; padding: 10px; border-radius: 6px; font-weight: 600; font-size: 13px; display: flex; align-items: center; justify-content: center; gap: 8px;">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
-                                <polygon points="5 4 15 12 5 20 5 4"></polygon>
-                                <line x1="19" y1="5" x2="19" y2="19"></line>
-                            </svg>
-                            <span id="btnNextPhaseText">다음 단계 진행</span>
-                        </button>
+                        <!-- 제어 버튼([일시정지]/[강제 종료]/[다음 단계])은 작업 맥락 인접성을 위해
+                             좌측 [분석 실행] 패널의 "선별 검사 시작" 버튼 하단으로 이동되었다. -->
                     </div>
 
                     <!-- ①-C [에러 발생 상태] 컴포넌트 -->

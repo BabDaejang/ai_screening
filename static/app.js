@@ -667,6 +667,18 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    // [분석 실행] 영역 접기/펼치기 — 좁은 화면에서 하단 정보 확보용
+    const btnToggleAnalysisPanel = document.getElementById("btnToggleAnalysisPanel");
+    if (btnToggleAnalysisPanel) {
+        btnToggleAnalysisPanel.addEventListener("click", () => {
+            const body = document.getElementById("analysisPanelBody");
+            if (!body) return;
+            const isCollapsed = body.style.display === "none";
+            body.style.display = isCollapsed ? "" : "none";
+            btnToggleAnalysisPanel.textContent = isCollapsed ? "▲ 접기" : "▼ 펼치기";
+        });
+    }
+
     const btnCreateProject = document.getElementById("btnCreateProject");
     if (btnCreateProject) {
         btnCreateProject.addEventListener("click", createNewProject);
@@ -1112,6 +1124,12 @@ document.addEventListener("DOMContentLoaded", () => {
         frameStateRunning.style.display = "none";
         frameStateError.style.display = "none";
 
+        // 좌측 사이드바로 이동된 파이프라인 제어 버튼: 파이프라인이 실제로
+        // 살아있는 상태(진행/일시정지/단계 대기)에서만 활성화한다.
+        const pipelineAlive = ["running", "paused", "awaiting_phase", "awaiting_stage3_selection"].includes(stateName);
+        if (btnPauseFrame) btnPauseFrame.disabled = !pipelineAlive;
+        if (btnStopFrame) btnStopFrame.disabled = !pipelineAlive;
+
         if (stateName === "idle" || stateName === "completed" || stateName === "stopped") {
             // 대기/완료 상태: 대기 화면 활성화
             frameStateIdle.style.display = "block";
@@ -1444,7 +1462,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 <td>${escapeHtml(b.author || "-")}</td>
                 <td style="font-size: 11.5px; color: var(--text-muted);">${escapeHtml(b.updated_at || "-")}</td>
                 <td>
-                    <div style="display: flex; gap: 6px;">
+                    <div class="action-btn-group">
                         <button class="btn btn-sm btn-outline btn-view-factsheet" data-cache-key="${escapeHtml(b.cache_key)}" data-title="${escapeHtml(b.book_title || "")}">
                             팩트시트 확인
                         </button>
@@ -1949,21 +1967,22 @@ document.addEventListener("DOMContentLoaded", () => {
                 <tr>
                     <td style="font-weight: 600;">${studentIdStr}</td>
                     <td style="font-weight: 600;">${studentNameStr}</td>
-                    <td>${escapeHtml(r.book_title || "미상")}</td>
+                    <td class="cell-ellipsis" title="${escapeHtml(r.book_title || "미상")}">${escapeHtml(r.book_title || "미상")}</td>
                     <td>${stage1Str}</td>
                     <td>${stage2Str}</td>
                     <td>${stage3Str}</td>
                     <td><span class="badge ${badgeClass}">${r.tier || "-"}</span></td>
                     <td>
-                        <div style="display: flex; gap: 6px; align-items: center;">
+                        <!-- 가로 1줄 강제(.action-btn-group): 세로 누적으로 행 높이가 팽창하는 결함 방지 -->
+                        <div class="action-btn-group">
                             <button class="btn btn-sm btn-outline btn-view-detail" data-student="${escapeHtml(r.student)}">
                                 상세보기
                             </button>
                             <button class="btn btn-sm btn-success btn-enrich-factsheet" data-title="${escapeHtml(r.book_title || '')}" data-author="${escapeHtml(r.author || r.stage2?.author || '')}">
                                 팩트시트 보강
                             </button>
-                            <button class="btn btn-sm btn-outline btn-edit-student" data-student="${escapeHtml(r.student)}" title="학생 정보 수정" style="padding: 4px 8px;">✏️</button>
-                            <button class="btn btn-sm btn-outline btn-delete-student" data-student="${escapeHtml(r.student)}" title="학생 삭제" style="padding: 4px 8px;">🗑️</button>
+                            <button class="btn btn-sm btn-outline btn-edit-student" data-student="${escapeHtml(r.student)}" title="학생 정보 수정">✏️</button>
+                            <button class="btn btn-sm btn-outline btn-delete-student" data-student="${escapeHtml(r.student)}" title="학생 삭제">🗑️</button>
                         </div>
                     </td>
                 </tr>
