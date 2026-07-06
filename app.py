@@ -25,6 +25,7 @@ from utils.user_manager import UserManager
 from utils.cost_tracker import CostTracker
 from utils.docx_metadata import extract_docx_metadata
 from utils.file_reader import read_submissions, strip_float_tail
+from utils.book_api import lookup_book_metadata
 from utils.report_generator import generate_csv, generate_report, calculate_tiers
 from utils.session_store import (
     save_session_progress,
@@ -280,10 +281,9 @@ def normalize_cache_key(title: str, author: str) -> str:
 def find_cached_book_entry_by_title(book_title: str, book_cache: dict) -> Optional[tuple]:
     """도서명만으로 book_cache.json의 기존 엔트리를 탐색한다 (title-first 폴백).
 
-    캐시 키는 '도서명_저자명' 조합이라서 저자가 미상이면 키 조회가 불가능했고,
-    이 때문에 이미 캐시에 있는 책인데도 저자 역추적(lookup_author) LLM 호출이
-    먼저 발생하는 토큰 누수가 있었다. 도서명 정규화 일치로 기존 엔트리를 먼저
-    찾아 저자·팩트시트를 재사용하면 캐시 히트 시 LLM 호출이 완전히 0이 된다.
+    캐시 키는 '도서명_저자명' 조합이라서 저자가 미상이면 키 조회가 불가능하다.
+    도서명 정규화 일치로 기존 엔트리를 먼저 찾아 저자·팩트시트를 재사용하면
+    캐시 히트 시 외부 API(네이버 책 검색) 호출조차 생략된다.
 
     Returns:
         (cache_key, entry) 또는 None.
@@ -414,18 +414,17 @@ def append_screening_result(result: dict):
     except OSError as e:
         logger.error(f"screening_results.jsonl 저장 실패: {e}")
 
-def lookup_author(book_title: str, provider) -> str:
-    """책 제목을 기반으로 AI 모델을 호출하여 원작자/저자명을 역추적(Reverse Lookup)합니다."""
-    if not book_title or book_title.lower() == "unknown":
-        return "Unknown"
-    
-    system_prompt = "당신은 도서 저자명을 찾고 JSON 형태로만 반환하는 도서 도우미입니다. 반드시 아래 JSON 형식으로만 응답하세요.\n{\n  \"author\": \"저자명\"\n}"
-    try:
-        res = provider.screen(system_prompt, f"도서명: {book_title}")
-        if isinstance(res, dict) and "author" in res and res["author"]:
-            return str(res["author"]).strip()
-    except Exception as e:
-        logger.error(f"저자 역추적 중 에러: {e}")
+# [폐기] LLM 기반 저자 역추적 lookup_author()는 완전히 제거되었다.
+# 저자 확정은 utils/book_api.lookup_book_metadata() (네이버 책 검색 OpenAPI,
+# .env의 NAVER_CLIENT_ID/SECRET 사용)가 Zero-Token으로 대체 수행한다.
+def resolve_author_via_naver(book_title: str) -> str:
+    """네이버 책 검색 API로 도서의 공식 저자명을 확정한다 (LLM 호출·토큰 소모 0).
+
+    실패(키 미설정/미검색/통신 오류) 시 'Unknown'을 반환하며 파이프라인은 계속 진행된다.
+    """
+    meta = lookup_book_metadata(book_title)
+    if meta and meta.get("author"):
+        return meta["author"]
     return "Unknown"
 
 def ensure_book_factsheet_cached(
@@ -985,8 +984,31 @@ def import_data(req: DataImportRequest):
         analysis_state["results"].extend(added)
         snapshot = list(analysis_state["results"])
 
+    # [Data Sanitization — Zero-Token] 데이터 로드 시점에 도서 메타데이터를 확정한다.
+    # 1) '도서명(저자명)' 복합 텍스트를 즉시 분리하고,
+    # 2) 저자가 여전히 없는 도서는 네이버 책 검색 API(.env 키)로 공식 저자를 조회한다.
+    # added의 각 원소는 analysis_state["results"] 내 동일 dict 객체이므로 스냅샷 저장에 그대로 반영된다.
+    naver_author_memo: dict[str, str] = {}
+    naver_resolved = 0
+    for sub in added:
+        parsed_title, parsed_author = parse_book_title_author(sub.get("book_title"))
+        if parsed_title:
+            sub["book_title"] = parsed_title
+        if parsed_author and not sub.get("author"):
+            sub["author"] = parsed_author
+        title = sub.get("book_title")
+        if title and not sub.get("author"):
+            if title not in naver_author_memo:
+                meta = lookup_book_metadata(title)
+                naver_author_memo[title] = (meta or {}).get("author", "")
+            if naver_author_memo[title]:
+                sub["author"] = naver_author_memo[title]
+                naver_resolved += 1
+
     save_session_progress(snapshot, status="loaded")
     msg = f"데이터 가져오기 완료: 신규 {len(added)}명 추가, 중복 {skipped}명 무시 (총 {len(snapshot)}명 적재)"
+    if naver_resolved:
+        msg += f" / 네이버 책 검색으로 저자 확정 {naver_resolved}건 (토큰 0)"
     add_log(f"📥 [Smart Append] {msg} — session_progress.json 동기화 완료.")
     return {"message": msg, "added": len(added), "skipped": skipped, "total": len(snapshot)}
 
@@ -1231,9 +1253,10 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
             book_cache = load_book_cache()
             book_author_map: dict[str, str] = {}
 
-            def _resolve_author(book_title: str, provider) -> str:
-                """도서 저자 확보 (우선순위: 세션 메모 → 1단계 '도서명(저자)' 파싱값
-                → book_cache 도서명 일치 폴백 → 최후에만 LLM 역추적).
+            def _resolve_author(book_title: str) -> str:
+                """도서 저자 확보 (우선순위: 세션 메모 → 레코드 저장값('도서명(저자)' 파싱
+                또는 데이터 가져오기 시 네이버 확정값) → book_cache 도서명 일치 폴백
+                → 최후에 네이버 책 검색 API — 전 경로 LLM 호출 없음, Zero-Token).
                 Phase 1.5 선제 생성과 Phase 2 JIT 생성이 공통으로 사용한다."""
                 if book_title in book_author_map:
                     return book_author_map[book_title]
@@ -1244,15 +1267,19 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                 )
                 if not author:
                     # Title-first 캐시 폴백: 저자 미상이라도 도서명 정규화 일치로 기존
-                    # 캐시 엔트리를 먼저 탐색 → 캐시 히트 시 역추적 LLM 호출 완전 생략.
+                    # 캐시 엔트리를 먼저 탐색 → 캐시 히트 시 외부 API 호출조차 생략.
                     with book_cache_lock:
                         cached_hit = find_cached_book_entry_by_title(book_title, book_cache)
                     if cached_hit:
                         author = cached_hit[1].get("author") or "Unknown"
-                        add_log(f"💾 캐시 재사용: '{book_title}' 저자('{author}') 복원 — 역추적 LLM 호출 생략 (토큰 0)")
+                        add_log(f"💾 캐시 재사용: '{book_title}' 저자('{author}') 복원 (토큰 0)")
                     else:
-                        add_log(f"🔍 '{book_title}' 도서의 저자 정보 누락 감지. 저자 역추적 중...")
-                        author = lookup_author(book_title, provider)
+                        add_log(f"🔍 '{book_title}' 저자 정보 누락 — 네이버 책 검색 API로 확정 중... (Zero-Token)")
+                        author = resolve_author_via_naver(book_title)
+                        if author != "Unknown":
+                            add_log(f"✅ 네이버 API 저자 확정: '{book_title}' → '{author}' (LLM 호출·토큰 소모 0)")
+                        else:
+                            add_log(f"⚠️ 네이버 API에서 '{book_title}' 저자를 찾지 못해 'Unknown'으로 진행합니다.")
                 book_author_map[book_title] = author
                 return author
 
@@ -1302,7 +1329,7 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                             with state_lock:
                                 analysis_state["prefetch"] = {"total": sample_size, "done": done, "current": title}
                             try:
-                                author = _resolve_author(title, provider_prefetch)
+                                author = _resolve_author(title)
                                 ensure_book_factsheet_cached(
                                     title, author, provider_prefetch,
                                     book_cache, factsheets_dir, req.no_web,
@@ -1459,7 +1486,7 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                     try:
                         if not book_title or book_title.lower() == "unknown":
                             return None
-                        author = _resolve_author(book_title, provider_verify)
+                        author = _resolve_author(book_title)
                         # 확정된 저자를 같은 도서의 모든 후보 레코드에 반영 (데이터 유실 방지)
                         for cand in candidates:
                             cand_title = cand.get("stage2", {}).get("book_title") or cand.get("book_title")

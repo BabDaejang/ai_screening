@@ -175,6 +175,26 @@ class UserManager:
 
         return self._save()
 
+    @staticmethod
+    def _normalize_default_models(profile: dict) -> dict:
+        """[Migration & Fallback Guard] 구버전 프로필의 단일 모델 스키마를 2분할 스키마로 변환한다.
+
+        과거에는 {"provider", "model"} 또는 {"provider", "model_screening", "model_verify"}
+        형태로 저장된 경우가 있어, 분리된 키가 없으면 레거시 단일 값을 스크리닝/검증
+        양쪽의 Fallback으로 사용한다. 어떤 형태가 와도 4개 키를 모두 갖춘 dict를 반환
+        하므로 이후 로직이 KeyError 없이 안전하게 동작한다.
+        """
+        dm = profile.get("default_models") or {}
+        legacy_provider = dm.get("provider", "")
+        legacy_screening_model = dm.get("model_screening") or dm.get("model", "")
+        legacy_verify_model = dm.get("model_verify") or dm.get("model", "")
+        return {
+            "screening_provider": dm.get("screening_provider") or legacy_provider,
+            "screening_model": dm.get("screening_model") or legacy_screening_model,
+            "verify_provider": dm.get("verify_provider") or legacy_provider,
+            "verify_model": dm.get("verify_model") or legacy_verify_model,
+        }
+
     def add_api_key(self, profile_name: str, provider: str, api_key: str, password: Optional[str] = None) -> bool:
         """현재 프로필에 특정 프로바이더의 API 키를 .env 파일에 저장하고 런타임에도 즉시 등록합니다."""
         env_path = Path(__file__).parent.parent / ".env"
@@ -231,12 +251,7 @@ class UserManager:
                 
         self._current_decrypted_keys = env_keys
 
-        default_models = profile.get("default_models", {
-            "screening_provider": "",
-            "screening_model": "",
-            "verify_provider": "",
-            "verify_model": ""
-        })
+        default_models = self._normalize_default_models(profile)
 
         return {
             "name": profile_name,
@@ -260,12 +275,7 @@ class UserManager:
         for name, profile in self._data["profiles"].items():
             providers = list(profile.get("api_keys", {}).keys())
 
-            default_models = profile.get("default_models", {
-                "screening_provider": "",
-                "screening_model": "",
-                "verify_provider": "",
-                "verify_model": ""
-            })
+            default_models = self._normalize_default_models(profile)
 
             result.append({
                 "name": name,
@@ -326,12 +336,7 @@ class UserManager:
         if not profile:
             return None
 
-        default_models = profile.get("default_models", {
-            "screening_provider": "",
-            "screening_model": "",
-            "verify_provider": "",
-            "verify_model": ""
-        })
+        default_models = self._normalize_default_models(profile)
 
         # .env 또는 os.environ 에서 API 키 읽어오기
         env_keys = {}

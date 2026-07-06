@@ -648,20 +648,27 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function applyDefaultModels(defaults) {
         if (!defaults) return;
-        
-        if (defaults.screening_provider) {
-            selectScreeningProvider.value = defaults.screening_provider;
-            populateModelDropdown("screening", defaults.screening_provider, selectScreeningModel);
-            if (defaults.screening_model) {
-                selectScreeningModel.value = defaults.screening_model;
+
+        // [Fallback Guard] 구버전 프로필의 단일 모델 스키마({provider, model})가 오더라도
+        // 크래시 없이 스크리닝/검증 양쪽 기본값으로 폴백한다.
+        const screeningProvider = defaults.screening_provider || defaults.provider || "";
+        const screeningModel = defaults.screening_model || defaults.model_screening || defaults.model || "";
+        const verifyProvider = defaults.verify_provider || defaults.provider || "";
+        const verifyModel = defaults.verify_model || defaults.model_verify || defaults.model || "";
+
+        if (screeningProvider) {
+            selectScreeningProvider.value = screeningProvider;
+            populateModelDropdown("screening", screeningProvider, selectScreeningModel);
+            if (screeningModel) {
+                selectScreeningModel.value = screeningModel;
             }
         }
-        
-        if (defaults.verify_provider) {
-            selectVerifyProvider.value = defaults.verify_provider;
-            populateModelDropdown("verify", defaults.verify_provider, selectVerifyModel);
-            if (defaults.verify_model) {
-                selectVerifyModel.value = defaults.verify_model;
+
+        if (verifyProvider) {
+            selectVerifyProvider.value = verifyProvider;
+            populateModelDropdown("verify", verifyProvider, selectVerifyModel);
+            if (verifyModel) {
+                selectVerifyModel.value = verifyModel;
             }
         }
     }
