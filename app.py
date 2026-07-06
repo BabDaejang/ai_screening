@@ -1,5 +1,5 @@
 from dotenv import load_dotenv
-load_dotenv() # .env 로드
+load_dotenv() # .env 로드 (로컬 개발용 — Vercel 배포 시에는 Environment Variables가 주입됨)
 
 import asyncio
 import csv
@@ -8,18 +8,21 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 import webbrowser
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Depends, Header
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from utils.user_manager import UserManager
+from database import DatabaseError, db_select, db_select_one, db_upsert
+from utils.user_manager import UserManager, SUPPORTED_PROVIDERS
 from utils.cost_tracker import CostTracker
 from utils.docx_metadata import extract_docx_metadata
 from utils.file_reader import read_submissions, strip_float_tail
@@ -29,6 +32,7 @@ from utils.session_store import (
     save_session_progress,
     load_session_progress,
     parse_session_payload,
+    export_session_payload,
     session_file_info,
     create_project,
     list_projects,
@@ -36,8 +40,8 @@ from utils.session_store import (
     set_active_project,
     clear_active_project,
     get_active_project,
-    active_project_dir,
-    active_session_path,
+    load_checkpoint_map,
+    upsert_checkpoint,
     migrate_legacy_session,
 )
 from providers import create_provider
@@ -49,6 +53,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AI 의심 선별 도구 웹 UI")
+
+# 서버리스(읽기 전용 FS) 호환: 리포트/CSV 등 파생 산출물은 임시 디렉토리에만 쓴다.
+# 원본 데이터(세션·체크포인트·팩트시트)는 전부 Supabase DB에 영속화된다.
+OUTPUTS_DIR = os.path.join(tempfile.gettempdir(), "ai_screening_outputs")
 
 # 전역 상태 관리
 analysis_state = {
@@ -196,8 +204,9 @@ def update_progress(progress: int, step: str):
 # -------------------------------------------------------------
 # API 모델 정의
 # -------------------------------------------------------------
-class ProfileCreateRequest(BaseModel):
-    name: str
+class AuthRequest(BaseModel):
+    username: str
+    password: str
 
 class ApiKeyRegisterRequest(BaseModel):
     provider: str
@@ -207,9 +216,6 @@ class ApiKeyBatchRequest(BaseModel):
     gemini: Optional[str] = None
     anthropic: Optional[str] = None
     openai: Optional[str] = None
-
-class LoginRequest(BaseModel):
-    name: str
 
 class ModelSelectRequest(BaseModel):
     screening_provider: str
@@ -241,30 +247,43 @@ class EnrichRequest(BaseModel):
     verify_model: Optional[str] = None
 
 # -------------------------------------------------------------
-# 단일 마스터 파일 기반 도서 정보 캐시 엔진 (book_cache.json)
+# 도서 팩트시트 캐시 엔진 — Supabase factsheets 테이블 (구 book_cache.json 대체)
+# 여러 사용자·프로젝트가 공유하는 글로벌 캐시 (Cache Hit 시 토큰 소모 0).
 # -------------------------------------------------------------
 def load_book_cache() -> dict:
-    """book_cache.json 마스터 파일에서 캐시 딕셔너리를 로드합니다. 손상 시 빈 딕셔너리를 반환합니다."""
-    cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "book_cache.json")
-    if not os.path.exists(cache_path):
-        return {}
-    try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning(f"book_cache.json 로드 실패 (손상 가능성), 신규 생성: {e}")
-        return {}
+    """factsheets 테이블 전체를 {cache_key: entry} 딕셔너리로 로드합니다 (구버전과 동일 구조).
 
-def save_book_cache(cache_data: dict):
-    """book_cache.json 마스터 파일에 캐시 딕셔너리를 안전하게 저장합니다 (Write-Through: flush+fsync)."""
-    cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "book_cache.json")
+    DB 장애 시 빈 딕셔너리를 반환하여 파이프라인은 Cache Miss(JIT 생성)로 계속 진행된다.
+    """
     try:
-        with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(cache_data, f, ensure_ascii=False, indent=4)
-            f.flush()
-            os.fsync(f.fileno())
-    except OSError as e:
-        logger.error(f"book_cache.json 저장 실패: {e}")
+        rows = db_select("factsheets")
+    except DatabaseError as e:
+        logger.warning(f"factsheets 테이블 로드 실패 (Cache Miss로 계속 진행): {e}")
+        return {}
+    cache = {}
+    for row in rows:
+        cache[row["cache_key"]] = {
+            "book_title": row.get("book_title", ""),
+            "author": row.get("author", ""),
+            "factsheet": row.get("factsheet", ""),
+            "updated_at": row.get("updated_at", ""),
+            "is_enriched": bool(row.get("is_enriched", False)),
+        }
+    return cache
+
+def save_book_cache_entry(cache_key: str, entry: dict):
+    """도서 1권의 팩트시트 엔트리를 factsheets 테이블에 즉시 upsert합니다 (Write-Through)."""
+    try:
+        db_upsert("factsheets", {
+            "cache_key": cache_key,
+            "book_title": entry.get("book_title", ""),
+            "author": entry.get("author", ""),
+            "factsheet": entry.get("factsheet", ""),
+            "updated_at": entry.get("updated_at", ""),
+            "is_enriched": bool(entry.get("is_enriched", False)),
+        }, on_conflict="cache_key")
+    except DatabaseError as e:
+        logger.error(f"factsheets 테이블 저장 실패 ({cache_key}): {e}")
 
 def normalize_cache_key(title: str, author: str) -> str:
     """공백 및 파일 시스템 금지 문자를 제거하여 고유 키를 정형화합니다."""
@@ -357,71 +376,26 @@ def parse_book_title_author(raw_title: Optional[str]) -> tuple[str, Optional[str
         return (raw_title or "").strip(), None
 
 # -------------------------------------------------------------
-# 2단계 스크리닝 결과 Append-Only 영속화 & 체크포인트-재개(Resume) 엔진
-# (screening_results.jsonl)
+# 2단계 스크리닝 결과 영속화 & 체크포인트-재개(Resume) 엔진
+# (Supabase checkpoints 테이블 — 구 screening_results.jsonl 대체)
 # -------------------------------------------------------------
-# [폐기] 구버전 글로벌 체크포인트 경로 — 활성 프로젝트가 없을 때의 폴백으로만 사용
-_LEGACY_RESULTS_JSONL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screening_results.jsonl")
-
-def RESULTS_JSONL_PATH_current() -> str:
-    """체크포인트(jsonl) 경로: 활성 프로젝트 폴더 내에 프로젝트별로 격리 저장한다.
-
-    프로젝트마다 독립된 체크포인트를 가지므로 서로 다른 프로젝트의
-    동명 학생이 잘못 스킵(Resume)되는 교차 오염이 발생하지 않는다.
-    """
-    d = active_project_dir()
-    if d:
-        return os.path.join(d, "screening_results.jsonl")
-    return _LEGACY_RESULTS_JSONL_PATH
-
 def load_completed_results() -> dict:
-    """screening_results.jsonl을 스캔하여 이미 완료된 [학번_성명] 인덱스를 로드합니다.
+    """활성 프로젝트의 체크포인트에서 이미 완료된 [학번_성명] 인덱스를 로드합니다.
 
-    손상된 라인은 건너뛰고 계속 진행합니다 (Fault Tolerance). 반환된 딕셔너리는
-    이후 루프 진입 전 `if target in completed_map: skip` 판단에 사용되어
-    중복 API 호출과 토큰 낭비를 원천 차단합니다.
+    반환된 딕셔너리는 이후 루프 진입 전 `if target in completed_map: skip` 판단에
+    사용되어 중복 API 호출과 토큰 낭비를 원천 차단합니다.
     """
-    completed: dict = {}
-    jsonl_path = RESULTS_JSONL_PATH_current()
-    if not os.path.exists(jsonl_path):
-        return completed
-    try:
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line_no, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.warning(f"screening_results.jsonl 손상된 라인 스킵 (line {line_no})")
-                    continue
-                student_key = record.get("student")
-                if student_key:
-                    completed[student_key] = record
-    except OSError as e:
-        logger.error(f"screening_results.jsonl 로드 실패: {e}")
-    return completed
+    return load_checkpoint_map()
 
 def append_screening_result(result: dict):
-    """피실험자 1명(Atomic Unit)의 최종 스크리닝 결과를 즉시 행 단위로 append-only 영속화합니다.
-
-    전역 버퍼를 거치지 않고 디스크에 즉시 flush + fsync하여, 사용자가 프로세스를
-    강제 종료하더라도 이미 완료된 데이터는 유실되지 않도록 보장합니다.
+    """피실험자 1명(Atomic Unit)의 최종 스크리닝 결과를 활성 프로젝트 체크포인트에
+    즉시 영속화합니다 (DB upsert). 프로세스가 강제 종료되더라도 이미 완료된
+    데이터는 유실되지 않습니다.
     """
-    try:
-        jsonl_path = RESULTS_JSONL_PATH_current()
-        os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
-        with open(jsonl_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(result, ensure_ascii=False, default=str) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+    if upsert_checkpoint(result):
         student = result.get("student", "?")
-        msg = f"[SUCCESS: Saved Screening Result for {student} to screening_results.jsonl]"
-        print(msg)
+        msg = f"[SUCCESS: Saved Screening Result for {student} to DB checkpoint]"
         add_log(msg)
-    except OSError as e:
-        logger.error(f"screening_results.jsonl 저장 실패: {e}")
 
 # [폐기] LLM 기반 저자 역추적 lookup_author()는 완전히 제거되었다.
 # 저자 확정은 utils/book_api.lookup_book_metadata() (네이버 책 검색 OpenAPI,
@@ -446,12 +420,12 @@ def ensure_book_factsheet_cached(
 ) -> str:
     """도서 1권의 팩트시트를 확보한다 (CASE A: Cache Hit 재사용 / CASE B: Cache Miss → JIT 생성 후 Write-Through).
 
-    - Cache Hit: book_cache.json의 로컬 팩트시트를 즉시 반환 (LLM 호출·토큰 소모 0).
+    - Cache Hit: factsheets 테이블의 팩트시트를 즉시 반환 (LLM 호출·토큰 소모 0).
     - Cache Miss: '그 시점에 해당 도서 1권에 대해서만' LLM을 호출해 생성하고 즉시
-      book_cache.json에 Append(Write-Through: flush+fsync)한다. 생성 중에는
+      factsheets 테이블에 upsert(Write-Through)한다. 생성 중에는
       analysis_state["factsheet_generating"]에 도서명을 세팅하여 UI가
       "'{도서명}' 팩트시트 신규 생성 중..." 스피너를 표시하도록 한다.
-    Phase 1.5(마이크로 배치 선제 생성)와 Phase 2(JIT 검증)에서 공통으로 재사용된다.
+    (구버전의 로컬 factsheets/*.md 동기화 쓰기는 서버리스 읽기 전용 FS 제약으로 폐기됨.)
     """
     cache_key = normalize_cache_key(book_title, author)
 
@@ -459,7 +433,7 @@ def ensure_book_factsheet_cached(
         cached_entry = book_cache.get(cache_key)
 
     if cached_entry is not None:
-        add_log(f"💾 캐시 히트! '{cache_key}' 도서 정보를 book_cache.json에서 불러옵니다. (토큰 0)")
+        add_log(f"💾 캐시 히트! '{cache_key}' 도서 정보를 DB 팩트시트 캐시에서 불러옵니다. (토큰 0)")
         factsheet_content = cached_entry.get("factsheet", "")
     else:
         if no_web:
@@ -478,27 +452,15 @@ def ensure_book_factsheet_cached(
                 analysis_state["factsheet_generating"] = None
 
         with book_cache_lock:
-            book_cache[cache_key] = {
+            entry = {
                 "book_title": book_title,
                 "author": author,
                 "factsheet": factsheet_content,
                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
-            save_book_cache(book_cache)
-        add_log(f"💾 '{cache_key}' 도서 정보를 book_cache.json에 저장 완료 (즉시 Append).")
-
-    if factsheet_content:
-        normalized_title = _normalize_title(book_title)
-        if normalized_title:
-            os.makedirs(factsheets_dir, exist_ok=True)
-            filepath = os.path.join(factsheets_dir, f"{normalized_title}.md")
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(factsheet_content)
-                f.flush()
-                os.fsync(f.fileno())
-            success_msg = f"[SUCCESS: Saved Fact Sheet for {book_title} to local file]"
-            print(success_msg)
-            add_log(success_msg)
+            book_cache[cache_key] = entry
+            save_book_cache_entry(cache_key, entry)
+        add_log(f"💾 '{cache_key}' 도서 정보를 DB 팩트시트 캐시에 저장 완료 (즉시 upsert).")
 
     return factsheet_content
 
@@ -586,26 +548,14 @@ def trigger_bg_model_refresh(api_keys: dict):
             t = threading.Thread(target=update_provider_models_worker, args=(provider, api_key), daemon=True)
             t.start()
 
-def trigger_bg_refresh_for_current_user():
-    """현재 로그인된 프로필의 API 키를 사용하여 백그라운드 갱신을 실행합니다."""
-    session = global_user_manager.get_session_data()
-    if session and session.get("api_keys"):
-        trigger_bg_model_refresh(session["api_keys"])
-
-def trigger_bg_refresh_all_profiles():
-    """모든 프로필을 검사하여 찾은 API 키들로 초기 백그라운드 갱신을 시도합니다."""
+def trigger_bg_refresh_for_user(user: dict):
+    """로그인 사용자의 API 키(호출 시점에 DB에서 복호화)로 모델 목록 백그라운드 갱신을 실행합니다."""
     try:
-        profiles = global_user_manager._data.get("profiles", {})
-        merged_keys = {}
-        for p_name, p_data in profiles.items():
-            keys = p_data.get("api_keys", {})
-            for provider, key in keys.items():
-                if provider not in merged_keys and key:
-                    merged_keys[provider] = key
-        if merged_keys:
-            trigger_bg_model_refresh(merged_keys)
+        keys = global_user_manager.get_decrypted_api_keys(user)
+        if keys:
+            trigger_bg_model_refresh(keys)
     except Exception as e:
-        logger.error(f"전체 프로필 키 수집 및 백그라운드 갱신 실패: {e}")
+        logger.error(f"모델 목록 백그라운드 갱신 실패: {e}")
 
 # -------------------------------------------------------------
 # 공통 설정 로드 함수
@@ -617,84 +567,103 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 # -------------------------------------------------------------
+# 인증 (Bearer 세션 토큰) — FastAPI 의존성
+# 클라이언트는 로그인 후 발급받은 토큰을 'Authorization: Bearer <token>'으로 제출한다.
+# 토큰은 무상태(Fernet 암호화 + TTL)이므로 서버리스 인스턴스 간 세션 공유가 필요 없다.
 # -------------------------------------------------------------
-# 프로필 API
+def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
+    if not authorization:
+        return None
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    return parts[1].strip() or None
+
+def get_optional_user(authorization: Optional[str] = Header(None)) -> Optional[dict]:
+    """토큰이 없거나 유효하지 않으면 None (로그인 상태 조회용)."""
+    token = _extract_bearer_token(authorization)
+    if not token:
+        return None
+    return global_user_manager.get_user_by_token(token)
+
+def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
+    """보호된 엔드포인트용: 유효한 로그인 사용자 행(dict)을 반환하거나 401."""
+    user = get_optional_user(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다 (세션이 없거나 만료되었습니다).")
+    return user
+
 # -------------------------------------------------------------
-@app.get("/api/profiles")
-def list_profiles():
-    return global_user_manager.list_profiles()
+# 계정(Authentication) API — 회원가입 / 로그인 / 계정 관리
+# -------------------------------------------------------------
+@app.post("/api/auth/register")
+def auth_register(req: AuthRequest):
+    """회원가입: username + 비밀번호(bcrypt 해시 저장). 성공 시 즉시 로그인 토큰 발급."""
+    try:
+        global_user_manager.register(req.username, req.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except DatabaseError as e:
+        logger.error(f"회원가입 DB 오류: {e}")
+        raise HTTPException(status_code=500, detail="데이터베이스 오류로 가입에 실패했습니다.")
+    res = global_user_manager.login(req.username, req.password)
+    return {"message": f"'{req.username}' 계정 생성 완료", "token": res["token"], "profile": res}
 
-@app.get("/api/profiles/current")
-def get_current_profile():
-    curr = global_user_manager.get_current_profile()
-    if not curr:
-        return {"logged_in": False, "profile_name": None}
-    
-    # 세션 데이터 확인
-    session = global_user_manager.get_session_data()
-    if not session:
-        return {"logged_in": False, "profile_name": curr}
-        
-    return {
-        "logged_in": True,
-        "profile_name": curr,
-        "api_keys": list(session["api_keys"].keys()),
-        "default_models": session["default_models"]
-    }
-
-@app.post("/api/profiles")
-def create_profile(req: ProfileCreateRequest):
-    success = global_user_manager.add_profile(name=req.name)
-    if not success:
-        raise HTTPException(status_code=400, detail="프로필 생성 실패 (이름 중복 등)")
-    return {"message": f"프로필 '{req.name}' 생성 완료"}
-
-@app.post("/api/profiles/login")
-def login(req: LoginRequest):
-    res = global_user_manager.login(req.name)
+@app.post("/api/auth/login")
+def auth_login(req: AuthRequest):
+    """로그인: 비밀번호 검증 후 Bearer 세션 토큰 발급."""
+    try:
+        res = global_user_manager.login(req.username, req.password)
+    except DatabaseError as e:
+        logger.error(f"로그인 DB 오류: {e}")
+        raise HTTPException(status_code=500, detail="데이터베이스 오류로 로그인에 실패했습니다.")
     if not res:
-        raise HTTPException(status_code=401, detail="없는 프로필입니다.")
+        raise HTTPException(status_code=401, detail="사용자 ID 또는 비밀번호가 올바르지 않습니다.")
     # 로그인 성공 시 API 키가 있을 경우 백그라운드 모델 갱신 실행
-    trigger_bg_refresh_for_current_user()
-    return {"message": "로그인 성공", "profile": res}
+    user = global_user_manager.get_user_by_id(res["user_id"])
+    if user:
+        trigger_bg_refresh_for_user(user)
+    return {"message": "로그인 성공", "token": res["token"], "profile": res}
 
 @app.post("/api/profiles/logout")
 def logout():
-    global_user_manager.logout()
+    """무상태 토큰 방식이므로 서버 측 세션 파기는 없다 (클라이언트가 토큰을 폐기)."""
     return {"message": "로그아웃 완료"}
 
-@app.delete("/api/profiles/{name}")
-def delete_profile(name: str):
-    if global_user_manager.delete_profile(name):
-        return {"message": "삭제 완료"}
-    raise HTTPException(status_code=404, detail="프로필을 찾을 수 없음")
+@app.get("/api/profiles/current")
+def get_current_profile(user: Optional[dict] = Depends(get_optional_user)):
+    if not user:
+        return {"logged_in": False, "profile_name": None}
+    return {
+        "logged_in": True,
+        "profile_name": user["username"],
+        "api_keys": list((user.get("encrypted_api_keys") or {}).keys()),
+        "default_models": global_user_manager._normalize_default_models(user),
+    }
 
+@app.delete("/api/profiles/me")
+def delete_my_account(user: dict = Depends(get_current_user)):
+    """본인 계정 삭제 (프로젝트/체크포인트는 FK cascade로 함께 삭제)."""
+    if global_user_manager.delete_user(user["id"]):
+        return {"message": "계정 삭제 완료"}
+    raise HTTPException(status_code=404, detail="계정을 찾을 수 없음")
+
+# -------------------------------------------------------------
+# API 키 관리 (Fernet 암호화 저장 — .env 저장 방식 폐기)
+# -------------------------------------------------------------
 @app.post("/api/profiles/keys")
-def register_api_key(req: ApiKeyRegisterRequest):
-    current = global_user_manager.get_current_profile()
-    if not current:
-        raise HTTPException(status_code=401, detail="로그인되어 있지 않습니다.")
-        
-    success = global_user_manager.add_api_key(
-        profile_name=current,
-        provider=req.provider,
-        api_key=req.api_key
-    )
+def register_api_key(req: ApiKeyRegisterRequest, user: dict = Depends(get_current_user)):
+    success = global_user_manager.set_api_key(user, req.provider, req.api_key)
     if success:
-        trigger_bg_refresh_for_current_user()
-        return {"message": f"{req.provider} API 키 등록 완료"}
+        trigger_bg_refresh_for_user(user)
+        return {"message": f"{req.provider} API 키 등록 완료 (암호화 저장)"}
     raise HTTPException(status_code=400, detail="API 키 등록 실패")
 
 @app.post("/api/profiles/keys/batch")
-def register_api_keys_batch(req: ApiKeyBatchRequest):
-    current = global_user_manager.get_current_profile()
-    if not current:
-        raise HTTPException(status_code=401, detail="로그인되어 있지 않습니다.")
-        
+def register_api_keys_batch(req: ApiKeyBatchRequest, user: dict = Depends(get_current_user)):
     # 각 공급자별로 넘어온 키가 있고, 마스킹(••••)이 아니며, 비어있지 않은 경우에만 등록
     updated = []
-    
-    # 헬퍼 함수
+
     def isValidKey(val: Optional[str]) -> bool:
         if not val:
             return False
@@ -704,40 +673,32 @@ def register_api_keys_batch(req: ApiKeyBatchRequest):
         return True
 
     if isValidKey(req.gemini):
-        global_user_manager.add_api_key(current, "gemini", req.gemini.strip())
+        global_user_manager.set_api_key(user, "gemini", req.gemini.strip())
         updated.append("gemini")
-        
+
     if isValidKey(req.anthropic):
-        global_user_manager.add_api_key(current, "anthropic", req.anthropic.strip())
+        global_user_manager.set_api_key(user, "anthropic", req.anthropic.strip())
         updated.append("anthropic")
-        
+
     if isValidKey(req.openai):
-        global_user_manager.add_api_key(current, "openai", req.openai.strip())
+        global_user_manager.set_api_key(user, "openai", req.openai.strip())
         updated.append("openai")
-        
+
     if updated:
-        trigger_bg_refresh_for_current_user()
-        
+        trigger_bg_refresh_for_user(user)
+
     return {"message": f"API 키 일괄 업데이트 완료: {', '.join(updated) if updated else '변경 없음'}"}
 
 @app.delete("/api/profiles/keys/{provider}")
-def delete_api_key(provider: str):
-    current = global_user_manager.get_current_profile()
-    if not current:
-        raise HTTPException(status_code=401, detail="로그인되어 있지 않습니다.")
-    
-    if global_user_manager.delete_api_key(current, provider):
+def delete_api_key(provider: str, user: dict = Depends(get_current_user)):
+    if global_user_manager.delete_api_key(user, provider):
         return {"message": f"{provider} API 키 삭제 완료"}
     raise HTTPException(status_code=404, detail="등록된 키를 찾을 수 없음")
 
 @app.post("/api/profiles/select-model")
-def select_model(req: ModelSelectRequest):
-    current = global_user_manager.get_current_profile()
-    if not current:
-        raise HTTPException(status_code=401, detail="로그인되어 있지 않습니다.")
-    
+def select_model(req: ModelSelectRequest, user: dict = Depends(get_current_user)):
     success = global_user_manager.select_model(
-        profile_name=current,
+        user,
         screening_provider=req.screening_provider,
         screening_model=req.screening_model,
         verify_provider=req.verify_provider,
@@ -770,12 +731,11 @@ def get_config():
     }
 
 @app.post("/api/config/refresh")
-def refresh_config(req: Optional[RefreshConfigRequest] = None):
-    session = global_user_manager.get_session_data()
-    if not session or not session.get("api_keys"):
-        raise HTTPException(status_code=401, detail="먼저 로그인하고 API 키를 등록해야 모델 목록을 갱신할 수 있습니다.")
-        
-    api_keys = session["api_keys"]
+def refresh_config(req: Optional[RefreshConfigRequest] = None, user: dict = Depends(get_current_user)):
+    # API 요청 직전에 DB의 암호화된 키를 복호화하여 사용 (평문은 어디에도 저장하지 않음)
+    api_keys = global_user_manager.get_decrypted_api_keys(user)
+    if not api_keys:
+        raise HTTPException(status_code=401, detail="먼저 API 키를 등록해야 모델 목록을 갱신할 수 있습니다.")
     target_provider = req.provider if req else None
     
     success_providers = []
@@ -941,16 +901,10 @@ if selected:
 
 # -------------------------------------------------------------
 # 다중 프로젝트(Workspace) 관리 API
-# 저장 구조: data/projects/{profile_name}/{project_id}/session.json
+# 저장 구조: Supabase projects 테이블 (user_id + project_id 복합키)
 # -------------------------------------------------------------
 class ProjectCreateRequest(BaseModel):
     name: Optional[str] = None
-
-def _require_login_profile() -> str:
-    current = global_user_manager.get_current_profile()
-    if not current:
-        raise HTTPException(status_code=401, detail="먼저 로그인해야 프로젝트를 관리할 수 있습니다.")
-    return current
 
 def _require_active_project() -> dict:
     """데이터 조작/분석 전 활성 프로젝트 존재를 강제하는 Guard Clause."""
@@ -963,45 +917,42 @@ def _require_active_project() -> dict:
     return active
 
 @app.get("/api/projects")
-def api_list_projects():
-    """현재 로그인 프로필의 프로젝트 목록(요약 정보 포함)을 반환한다.
+def api_list_projects(user: dict = Depends(get_current_user)):
+    """현재 로그인 사용자의 프로젝트 목록(요약 정보 포함)을 DB에서 반환한다.
 
-    구버전 단일 session_progress.json이 남아있으면 최초 1회 프로젝트로 자동 이관한다.
+    구버전 단일 session_progress.json이 로컬에 남아있으면 최초 1회 DB로 자동 이관한다.
     """
-    profile = _require_login_profile()
-    migrated = migrate_legacy_session(profile)
+    migrated = migrate_legacy_session(user["id"])
     active = get_active_project()
     return {
-        "projects": list_projects(profile),
-        "active_project_id": active["project_id"] if active and active.get("profile") == profile else None,
+        "projects": list_projects(user["id"]),
+        "active_project_id": active["project_id"] if active and active.get("user_id") == user["id"] else None,
         "migrated": migrated,
     }
 
 @app.post("/api/projects")
-def api_create_project(req: ProjectCreateRequest):
-    """새 프로젝트 생성 (초기화된 빈 세션 파일 기록). 활성화는 별도 activate 호출."""
-    profile = _require_login_profile()
+def api_create_project(req: ProjectCreateRequest, user: dict = Depends(get_current_user)):
+    """새 프로젝트 생성 (빈 세션 행 기록). 활성화는 별도 activate 호출."""
     name = (req.name or "").strip() or time.strftime("검토 프로젝트 %Y-%m-%d %H:%M")
     try:
-        meta = create_project(profile, name)
-    except OSError as e:
+        meta = create_project(user["id"], name)
+    except DatabaseError as e:
         raise HTTPException(status_code=500, detail=f"프로젝트 생성 실패: {e}")
     return {"message": f"프로젝트 '{name}' 생성 완료", "project": meta}
 
 @app.post("/api/projects/{project_id}/activate")
-def api_activate_project(project_id: str):
+def api_activate_project(project_id: str, user: dict = Depends(get_current_user)):
     """프로젝트를 '현재 활성 프로젝트'로 지정하고 세션 데이터를 메모리로 로드한다."""
-    profile = _require_login_profile()
     with state_lock:
         if _pipeline_busy():
             raise HTTPException(status_code=400, detail="분석이 진행 중일 때는 프로젝트를 전환할 수 없습니다. 먼저 정지해 주세요.")
 
-    data = load_session_progress(profile, project_id)
+    data = load_session_progress(user["id"], project_id)
     if data is None:
-        raise HTTPException(status_code=404, detail="프로젝트 세션 파일을 찾을 수 없거나 손상되었습니다.")
+        raise HTTPException(status_code=404, detail="프로젝트 세션 데이터를 찾을 수 없거나 손상되었습니다.")
 
     meta = data.get("project") or {}
-    set_active_project(profile, project_id, name=meta.get("name") or project_id,
+    set_active_project(user["id"], project_id, name=meta.get("name") or project_id,
                        created_at=meta.get("created_at") or "")
 
     results = data.get("results", [])
@@ -1026,16 +977,15 @@ def api_activate_project(project_id: str):
     }
 
 @app.delete("/api/projects/{project_id}")
-def api_delete_project(project_id: str):
-    """프로젝트 폴더(세션·체크포인트 포함)를 완전히 삭제한다."""
-    profile = _require_login_profile()
+def api_delete_project(project_id: str, user: dict = Depends(get_current_user)):
+    """프로젝트(세션·체크포인트 포함)를 DB에서 완전히 삭제한다."""
     active = get_active_project()
     is_active_target = bool(active and active.get("project_id") == project_id)
     with state_lock:
         if is_active_target and _pipeline_busy():
             raise HTTPException(status_code=400, detail="분석이 진행 중인 활성 프로젝트는 삭제할 수 없습니다. 먼저 정지해 주세요.")
 
-    if not delete_project(profile, project_id):
+    if not delete_project(user["id"], project_id):
         raise HTTPException(status_code=404, detail="해당 프로젝트를 찾을 수 없습니다.")
 
     # 활성 프로젝트를 삭제한 경우: 비활성화 + 메모리 데이터셋 초기화
@@ -1053,7 +1003,7 @@ class DataImportRequest(BaseModel):
     path: str
 
 @app.post("/api/data/import")
-def import_data(req: DataImportRequest):
+def import_data(req: DataImportRequest, user: dict = Depends(get_current_user)):
     """[데이터 가져오기] 파일/폴더 → 메모리 데이터셋(analysis_state["results"]) 적재.
 
     Smart Append: 기존에 로드되어 작업 중인 레코드는 절대 덮어쓰지 않는다.
@@ -1158,7 +1108,7 @@ def _persist_results_snapshot():
     return len(snapshot)
 
 @app.post("/api/students")
-def create_student(req: StudentCreateRequest):
+def create_student(req: StudentCreateRequest, user: dict = Depends(get_current_user)):
     """[학생 수동 추가] 파일 없이 텍스트 복붙으로 학생 1명을 메모리 데이터셋에 추가한다."""
     _require_active_project()
     student_id = strip_float_tail(req.student_id or "")
@@ -1194,7 +1144,7 @@ def create_student(req: StudentCreateRequest):
     return {"message": f"학생 '{record['student']}' 추가 완료", "student": record["student"], "total": total}
 
 @app.put("/api/students/{student_key}")
-def update_student(student_key: str, req: StudentUpdateRequest):
+def update_student(student_key: str, req: StudentUpdateRequest, user: dict = Depends(get_current_user)):
     """[수정] 학생 레코드의 학번/이름/도서명/본문을 갱신한다 (student_key = '학번_이름' 복합키)."""
     _require_active_project()
     with state_lock:
@@ -1229,7 +1179,7 @@ def update_student(student_key: str, req: StudentUpdateRequest):
     return {"message": f"학생 '{record['student']}' 수정 완료", "student": record["student"], "total": total}
 
 @app.delete("/api/students/{student_key}")
-def delete_student(student_key: str):
+def delete_student(student_key: str, user: dict = Depends(get_current_user)):
     """[삭제] 학생 레코드를 메모리 데이터셋과 활성 프로젝트 세션 파일에서 제거한다."""
     _require_active_project()
     with state_lock:
@@ -1256,10 +1206,14 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
     try:
         update_progress(5, "메모리 데이터셋 로드 중...")
 
-        # API 키 검증
-        api_keys = session_data.get("api_keys", {})
-        screening_key = api_keys.get(req.screening_provider)
-        verify_key = api_keys.get(req.verify_provider)
+        # [사용자별 API 키 주입] LLM API 요청 직전에 로그인 사용자의 DB 행에서
+        # 암호화된 키(encrypted_api_keys)를 가져와 Fernet(ENCRYPTION_KEY)으로
+        # 복호화하여 사용한다. 평문 키는 이 스레드의 메모리에만 존재한다.
+        user = global_user_manager.get_user_by_id(session_data["user_id"])
+        if not user:
+            raise Exception("사용자 계정을 찾을 수 없습니다. 다시 로그인해 주세요.")
+        screening_key = global_user_manager.get_decrypted_api_key(user, req.screening_provider)
+        verify_key = global_user_manager.get_decrypted_api_key(user, req.verify_provider)
 
         if not screening_key:
             raise Exception(f"2단계 스크리닝을 위한 {req.screening_provider} API Key가 등록되지 않았습니다.")
@@ -1366,9 +1320,11 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
                 })
                 new_results.append(sub)
 
-            # book_cache / factsheets_dir / book_author_map은 Phase 1.5 마이크로 배치 선제
-            # 생성 스레드와 3단계 JIT 팩트시트 확보 로직이 공유하는 상태이므로 한 번만 초기화한다.
-            factsheets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "factsheets")
+            # book_cache / factsheets_dir / book_author_map은 3단계 JIT 팩트시트 확보
+            # 로직이 공유하는 상태이므로 한 번만 초기화한다.
+            # factsheets_dir는 run_stage3 시그니처 호환용 임시 경로다 — ensure_cb(JIT)가
+            # 항상 주입되므로 실제 팩트시트 영속화는 DB(factsheets 테이블)에서만 일어난다.
+            factsheets_dir = os.path.join(tempfile.gettempdir(), "ai_screening_factsheets")
             os.makedirs(factsheets_dir, exist_ok=True)
             book_cache = load_book_cache()
             book_author_map: dict[str, str] = {}
@@ -1587,7 +1543,7 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
 
         # 7. 최종 데이터 포맷팅 및 CSV 준비
         update_progress(90, "최종 결과 리포트 작성 중...")
-        output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+        output_dir = OUTPUTS_DIR
         os.makedirs(output_dir, exist_ok=True)
         
         for r in results:
@@ -1628,9 +1584,10 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
             analysis_state["results"] = results
             analysis_state["cost_summary"] = cost_summary
 
-        # 최종 세션 스냅샷 저장 (State Portability — 타 PC에서 이어하기 가능)
+        # 최종 세션 스냅샷 저장 (State Portability — 어느 기기에서든 이어하기 가능)
         save_session_progress(results, cost_summary, status="completed")
-        add_log(f"💾 프로젝트 세션 저장 완료: {active_session_path() or '(활성 프로젝트 없음)'}")
+        active_meta = get_active_project()
+        add_log(f"💾 프로젝트 세션 DB 저장 완료: {active_meta['name'] if active_meta else '(활성 프로젝트 없음)'}")
 
         add_log("🎉 전체 파이프라인 분석이 성공적으로 끝났습니다!")
         
@@ -1648,13 +1605,13 @@ def run_pipeline_thread(req: AnalyzeRequest, session_data: dict, config: dict):
         add_log(f"❌ 에러가 발생했습니다: {e}")
 
 @app.post("/api/analyze")
-def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks):
+def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks,
+                   user: dict = Depends(get_current_user)):
     global analysis_state
-    
-    # 로그인 세션 데이터 가져오기
-    session_data = global_user_manager.get_session_data()
-    if not session_data:
-        raise HTTPException(status_code=401, detail="먼저 로그인하셔야 분석을 돌릴 수 있습니다.")
+
+    # 파이프라인 스레드에는 사용자 식별자만 넘긴다.
+    # 실제 API 키는 스레드가 LLM 호출 직전에 DB에서 복호화하여 사용한다.
+    session_data = {"user_id": user["id"], "profile_name": user["username"]}
 
     # 분석 결과는 활성 프로젝트의 session.json에 영속화되므로 활성 프로젝트가 필수다.
     _require_active_project()
@@ -1767,18 +1724,13 @@ def reset_analysis():
     return {"message": "상태 초기화 완료"}
 
 @app.post("/api/analyze/enrich-factsheet")
-async def enrich_factsheet(req: EnrichRequest):
-    # 1. 로그인 세션 및 API 키 획득
-    session = global_user_manager.get_session_data()
-    if not session:
-        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
-    api_keys = session.get("api_keys", {})
-
+async def enrich_factsheet(req: EnrichRequest, user: dict = Depends(get_current_user)):
     config = load_config()
     provider_name = req.verify_provider or config.get("verify", {}).get("provider", "gemini")
     model_name = req.verify_model or config.get("verify", {}).get("model", "gemini-2.5-flash")
 
-    api_key = api_keys.get(provider_name)
+    # API 요청 직전에 DB의 암호화된 키를 복호화하여 사용
+    api_key = global_user_manager.get_decrypted_api_key(user, provider_name)
     if not api_key:
         raise HTTPException(status_code=400, detail=f"3단계 검증을 위한 {provider_name} API Key가 등록되지 않았습니다. API 키를 먼저 등록해 주세요.")
 
@@ -1810,30 +1762,16 @@ async def enrich_factsheet(req: EnrichRequest):
     if not enriched_content or "에러:" in enriched_content or "실패했습니다" in enriched_content:
          raise HTTPException(status_code=500, detail="LLM이 팩트시트 보강 결과를 생성하지 못했습니다.")
 
-    # 4. 단일 마스터 파일(`book_cache.json`)에서 해당 Key의 데이터만 완벽하게 덮어쓰기(Overwrite) 및 동기화
-    #    (book_cache_lock: 파이프라인/선제생성 스레드와의 load-modify-save 경합 방지)
+    # 4. DB 팩트시트 캐시(factsheets 테이블)에서 해당 Key의 데이터만 덮어쓰기(upsert)
+    #    (book_cache_lock: 파이프라인 스레드와의 경합 방지)
     with book_cache_lock:
-        book_cache = load_book_cache()
-        book_cache[cache_key] = {
+        save_book_cache_entry(cache_key, {
             "book_title": req.book_title,
             "author": req.author,
             "factsheet": enriched_content,
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "is_enriched": True
-        }
-        save_book_cache(book_cache)
-    
-    # 5. 기존의 로컬 factsheets/ 디렉토리 내 마크다운 파일도 즉시 동기화 업데이트
-    try:
-        factsheets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "factsheets")
-        os.makedirs(factsheets_dir, exist_ok=True)
-        normalized_title = _normalize_title(req.book_title)
-        if normalized_title:
-            filepath = os.path.join(factsheets_dir, f"{normalized_title}.md")
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(enriched_content)
-    except Exception as e:
-        logger.warning(f"로컬 factsheet 파일 동기화 저장 실패: {e}")
+        })
 
     # UI 중앙 로그창에 알림 추가
     add_log(f"⚡ [온디맨드 보강 완료] '{req.book_title}'({req.author}) 도서 팩트시트 심층 보강 완료!")
@@ -1885,7 +1823,7 @@ def export_csv():
     if not results_snapshot:
         raise HTTPException(status_code=404, detail="아직 생성된 분석 결과가 없습니다. 먼저 분석을 시작해 주세요.")
 
-    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+    output_dir = OUTPUTS_DIR
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, "screening_summary.csv")
 
@@ -1910,7 +1848,7 @@ def _csv_val_to_float(val) -> Optional[float]:
         return None
 
 @app.post("/api/import")
-async def import_csv(file: UploadFile = File(...)):
+async def import_csv(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     """이전에 다운로드한 screening_summary.csv를 업로드하여 analysis_state["results"]를 복구한다.
 
     - 완전히 처리된(rule_score/ai_score 존재, 검증이 필요한 등급이면 hallucination_score도 존재) 행은
@@ -2046,16 +1984,20 @@ def get_session_info():
 
 @app.get("/api/session/download")
 def download_session_file():
-    """session_progress.json을 그대로 다운로드한다 (타 PC로 작업 이관용)."""
-    path = active_session_path()
-    if not path or not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="활성 프로젝트의 세션 파일이 없습니다. 먼저 프로젝트를 선택해 주세요.")
+    """활성 프로젝트 세션 스냅샷(DB)을 JSON 파일로 다운로드한다 (타 환경 이관·백업용)."""
+    payload_json = export_session_payload()
+    if payload_json is None:
+        raise HTTPException(status_code=404, detail="활성 프로젝트의 세션 데이터가 없습니다. 먼저 프로젝트를 선택해 주세요.")
     active = get_active_project() or {}
     download_name = f"{active.get('name') or 'project'}_session.json"
-    return FileResponse(path, media_type="application/json", filename=download_name)
+    return Response(
+        content=payload_json,
+        media_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(download_name)}"},
+    )
 
 @app.post("/api/session/upload")
-async def upload_session_file(file: UploadFile = File(...)):
+async def upload_session_file(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     """진행 상태 파일을 업로드하여 세션을 복원(Resume)한다.
 
     - 파일 이름이 변경되어 있어도 내용 스키마(schema/version)만 일치하면 복원된다.
@@ -2179,9 +2121,9 @@ def markdown_to_html(md: str) -> str:
 
 @app.get("/api/reports/{student}")
 def get_report(student: str):
-    # run_pipeline_thread에서 generate_report(r, output_dir)를 outputs/ 디렉토리 자체에 저장하므로
-    # (outputs/reports/ 하위 폴더가 아님) 실제 저장 경로와 동일하게 맞춘다.
-    reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+    # run_pipeline_thread에서 generate_report(r, output_dir)를 OUTPUTS_DIR 디렉토리 자체에
+    # 저장하므로 실제 저장 경로와 동일하게 맞춘다 (임시 산출물 — 원본은 DB 세션에 있음).
+    reports_dir = OUTPUTS_DIR
     file_path = os.path.join(reports_dir, f"{student}.md")
     
     if not os.path.exists(file_path):
@@ -2234,37 +2176,25 @@ def get_book_inventory():
 
 @app.get("/api/book-inventory/{cache_key}/factsheet")
 def get_book_factsheet(cache_key: str):
-    """특정 도서(cache_key)의 팩트시트 파일을 즉시 열람합니다 (파일 핸들러 조회 → 렌더링)."""
-    book_cache = load_book_cache()
-    entry = book_cache.get(cache_key)
+    """특정 도서(cache_key)의 팩트시트를 DB(factsheets 테이블)에서 즉시 열람합니다."""
+    try:
+        entry = db_select_one("factsheets", {"cache_key": cache_key})
+    except DatabaseError as e:
+        raise HTTPException(status_code=500, detail=f"팩트시트 조회 실패: {e}")
     if not entry:
-        raise HTTPException(status_code=404, detail="해당 도서가 book_cache.json 인벤토리에 존재하지 않습니다.")
+        raise HTTPException(status_code=404, detail="해당 도서가 팩트시트 인벤토리에 존재하지 않습니다.")
 
     book_title = entry.get("book_title", "")
-    factsheets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "factsheets")
-    normalized_title = _normalize_title(book_title) if book_title else ""
-    file_path = os.path.join(factsheets_dir, f"{normalized_title}.md") if normalized_title else ""
-
-    md_content = ""
-    if file_path and os.path.exists(file_path):
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                md_content = f.read()
-        except OSError as e:
-            logger.warning(f"팩트시트 파일 읽기 실패({file_path}): {e}")
-
-    # 로컬 .md 파일이 아직 없다면 book_cache.json에 캐시된 원문으로 대체
-    if not md_content.strip():
-        md_content = entry.get("factsheet", "")
+    md_content = entry.get("factsheet", "") or ""
 
     if not md_content.strip():
-        raise HTTPException(status_code=404, detail="해당 도서의 팩트시트 데이터 라인을 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail="해당 도서의 팩트시트 데이터를 찾을 수 없습니다.")
 
     return {
         "cache_key": cache_key,
         "book_title": book_title,
         "author": entry.get("author", ""),
-        "file_path": file_path,
+        "file_path": "Supabase DB (factsheets)",
         "markdown": md_content,
         "html": markdown_to_html(md_content),
     }
@@ -2277,22 +2207,20 @@ os.makedirs(static_dir, exist_ok=True)
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 
 # -------------------------------------------------------------
-# 싱글톤 UserManager 인스턴스
+# 싱글톤 UserManager 인스턴스 (무상태 — DB 기반이므로 서버리스 인스턴스 간 안전)
 # -------------------------------------------------------------
 global_user_manager = UserManager()
 
 # -------------------------------------------------------------
-# 서버 기동 시 세션 자동 복원 (State Persistence):
-# 마지막 session_progress.json 스냅샷이 있으면 결과 목록을 즉시 복구하여
-# 재기동 후에도 UI에서 이전 작업을 그대로 이어볼 수 있게 한다.
-# -------------------------------------------------------------
 # [다중 프로젝트 아키텍처] 서버 기동 시 자동 복원은 수행하지 않는다.
 # 로그인 후 [프로젝트 대시보드]에서 프로젝트를 activate하는 시점에 해당
-# 프로젝트의 session.json이 로드된다. 구버전 단일 session_progress.json은
-# GET /api/projects 최초 조회 시 프로젝트로 자동 이관(migrate_legacy_session)된다.
-
-# 앱 실행 시 모든 프로필의 API 키를 모아 모델 캐시를 백그라운드에서 동적 갱신
-trigger_bg_refresh_all_profiles()
+# 프로젝트의 세션(DB)이 로드된다. 구버전 단일 session_progress.json은
+# GET /api/projects 최초 조회 시 DB로 자동 이관(migrate_legacy_session)된다.
+#
+# 모델 목록 백그라운드 갱신은 각 사용자의 로그인 시점에만 해당 사용자의
+# (복호화된) 키로 수행한다 — 기동 시 전체 사용자 키 순회는 다중 사용자
+# 환경에서 불필요·부적절하므로 폐기되었다.
+# -------------------------------------------------------------
 
 def open_browser():
     try:

@@ -1,4 +1,32 @@
 // -------------------------------------------------------------
+// 인증 토큰 자동 첨부 fetch 래퍼
+// 로그인 성공 시 localStorage에 저장된 Bearer 토큰을 모든 /api/ 요청의
+// Authorization 헤더에 자동으로 실어 보낸다 (서버는 무상태 토큰 검증).
+// -------------------------------------------------------------
+const AUTH_TOKEN_KEY = "ai_screening_auth_token";
+
+function getAuthToken() {
+    return localStorage.getItem(AUTH_TOKEN_KEY);
+}
+
+function setAuthToken(token) {
+    if (token) localStorage.setItem(AUTH_TOKEN_KEY, token);
+    else localStorage.removeItem(AUTH_TOKEN_KEY);
+}
+
+(() => {
+    const origFetch = window.fetch.bind(window);
+    window.fetch = (input, init = {}) => {
+        const url = typeof input === "string" ? input : (input && input.url) || "";
+        const token = getAuthToken();
+        if (token && url.startsWith("/api/")) {
+            init.headers = Object.assign({}, init.headers || {}, { "Authorization": `Bearer ${token}` });
+        }
+        return origFetch(input, init);
+    };
+})();
+
+// -------------------------------------------------------------
 // App State Variables
 // -------------------------------------------------------------
 let currentProfile = null;
@@ -25,15 +53,19 @@ document.addEventListener("DOMContentLoaded", () => {
     const authRequiredPanel = document.getElementById("authRequiredPanel");
     const mainDashboard = document.getElementById("mainDashboard");
 
-    // Modal Auth
+    // Modal Auth (로그인: username + 비밀번호)
     const modalAuth = document.getElementById("modalAuth");
     const btnCloseAuthModal = document.getElementById("btnCloseAuthModal");
-    const profileCardsList = document.getElementById("profileCardsList");
     const btnGoToCreateProfile = document.getElementById("btnGoToCreateProfile");
+    const loginUsername = document.getElementById("loginUsername");
+    const loginPassword = document.getElementById("loginPassword");
+    const btnLoginSubmit = document.getElementById("btnLoginSubmit");
 
-    // Modal Create Profile
+    // Modal Create Profile (회원가입: username + 비밀번호 + 확인)
     const profileSelectView = document.getElementById("profileSelectView");
     const profileCreateView = document.getElementById("profileCreateView");
+    const newProfilePassword = document.getElementById("newProfilePassword");
+    const newProfilePassword2 = document.getElementById("newProfilePassword2");
     const btnCancelCreateProfile = document.getElementById("btnCancelCreateProfile");
     const btnCreateProfileSubmit = document.getElementById("btnCreateProfileSubmit");
 
@@ -171,6 +203,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // Create Profile Submit
     btnCreateProfileSubmit.addEventListener("click", createProfile);
+
+    // Login Submit (버튼 클릭 또는 비밀번호 입력창에서 Enter)
+    btnLoginSubmit.addEventListener("click", submitLogin);
+    loginPassword.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") submitLogin();
+    });
 
     // Provider select change -> update model options
     selectScreeningProvider.addEventListener("change", () => {
@@ -864,105 +902,49 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    async function openAuthModal() {
+    function openAuthModal() {
         modalAuth.style.display = "flex";
         profileSelectView.style.display = "block";
         profileCreateView.style.display = "none";
-
-        await loadProfilesList();
-    }
-
-    async function loadProfilesList() {
-        try {
-            const res = await fetch("/api/profiles");
-            const profiles = await res.json();
-
-            if (profiles.length === 0) {
-                profileCardsList.innerHTML = `<p class="text-center" style="color: var(--text-muted); font-size: 13px;">등록된 계정이 없습니다. 먼저 계정을 생성해주세요.</p>`;
-                return;
-            }
-
-            profileCardsList.innerHTML = profiles.map(p => `
-                <div class="profile-card ${p.is_current ? 'active' : ''}" data-name="${p.name}">
-                    <div class="profile-meta">
-                        <span class="p-name">${p.name}</span>
-                        <span class="p-desc">등록된 API: ${p.api_keys.length > 0 ? p.api_keys.join(", ").toUpperCase() : '없음'}</span>
-                    </div>
-                    <button class="btn-delete-profile" data-name="${p.name}">
-                        <svg style="width: 16px; height: 16px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <polyline points="3 6 5 6 21 6"></polyline>
-                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-                            <line x1="10" y1="11" x2="10" y2="17"></line>
-                            <line x1="14" y1="11" x2="14" y2="17"></line>
-                        </svg>
-                    </button>
-                </div>
-            `).join("");
-
-            document.querySelectorAll(".profile-card").forEach(card => {
-                card.addEventListener("click", async (e) => {
-                    if (e.target.closest(".btn-delete-profile")) return;
-                    
-                    const name = card.dataset.name;
-                    await submitLogin(name);
-                });
-            });
-
-            document.querySelectorAll(".btn-delete-profile").forEach(btn => {
-                btn.addEventListener("click", async (e) => {
-                    e.stopPropagation();
-                    const name = btn.dataset.name;
-                    if (confirm(`사용자 계정 '${name}'을(를) 삭제하시겠습니까?`)) {
-                        await deleteProfile(name);
-                    }
-                });
-            });
-
-        } catch (err) {
-            console.error("프로필 목록 로드 실패:", err);
-        }
-    }
-
-    async function deleteProfile(name) {
-        try {
-            const res = await fetch(`/api/profiles/${name}`, { method: "DELETE" });
-            if (res.ok) {
-                alert("계정이 삭제되었습니다.");
-                await loadProfilesList();
-                await checkLoginStatus();
-            } else {
-                const data = await res.json();
-                alert(`에러: ${data.detail}`);
-            }
-        } catch (err) {
-            console.error("프로필 삭제 에러:", err);
-        }
+        loginPassword.value = "";
+        setTimeout(() => loginUsername.focus(), 50);
     }
 
     async function createProfile() {
-        const payload = {
-            name: document.getElementById("newProfileName").value.trim ? document.getElementById("newProfileName").value.trim() : document.getElementById("newProfileName").value
-        };
+        const username = (document.getElementById("newProfileName").value || "").trim();
+        const password = newProfilePassword.value || "";
+        const password2 = newProfilePassword2.value || "";
 
-        if (!payload.name) {
+        if (!username) {
             alert("사용자 ID를 입력해 주세요.");
+            return;
+        }
+        if (password.length < 8) {
+            alert("비밀번호는 8자 이상이어야 합니다.");
+            return;
+        }
+        if (password !== password2) {
+            alert("비밀번호가 일치하지 않습니다.");
             return;
         }
 
         try {
-            const res = await fetch("/api/profiles", {
+            const res = await fetch("/api/auth/register", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload)
+                body: JSON.stringify({ username, password })
             });
+            const data = await res.json();
 
             if (res.ok) {
+                // 가입 성공 시 서버가 토큰을 함께 발급 — 즉시 로그인 상태로 전환
+                setAuthToken(data.token);
+                newProfilePassword.value = "";
+                newProfilePassword2.value = "";
                 profileCreateView.style.display = "none";
                 modalAuth.style.display = "none";
-                
-                await submitLogin(payload.name);
+                await checkLoginStatus();
             } else {
-                const data = await res.json();
                 alert(`계정 생성 실패: ${data.detail}`);
             }
         } catch (err) {
@@ -970,19 +952,28 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    async function submitLogin(profileName) {
+    async function submitLogin() {
+        const username = (loginUsername.value || "").trim();
+        const password = loginPassword.value || "";
+        if (!username || !password) {
+            alert("사용자 ID와 비밀번호를 입력해 주세요.");
+            return;
+        }
+
         try {
-            const res = await fetch("/api/profiles/login", {
+            const res = await fetch("/api/auth/login", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ name: profileName })
+                body: JSON.stringify({ username, password })
             });
+            const data = await res.json();
 
             if (res.ok) {
+                setAuthToken(data.token);
+                loginPassword.value = "";
                 modalAuth.style.display = "none";
                 await checkLoginStatus();
             } else {
-                const data = await res.json();
                 alert(`로그인 실패: ${data.detail}`);
             }
         } catch (err) {
@@ -992,13 +983,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function logout() {
         try {
-            const res = await fetch("/api/profiles/logout", { method: "POST" });
-            if (res.ok) {
-                alert("로그아웃 되었습니다.");
-                await checkLoginStatus();
-            }
+            await fetch("/api/profiles/logout", { method: "POST" });
         } catch (err) {
             console.error("로그아웃 에러:", err);
+        } finally {
+            // 무상태 토큰 방식: 클라이언트 토큰 폐기가 곧 로그아웃이다.
+            setAuthToken(null);
+            alert("로그아웃 되었습니다.");
+            await checkLoginStatus();
         }
     }
 

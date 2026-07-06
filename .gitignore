@@ -14,12 +14,22 @@ venv/
 env/
 ENV/
 
-# 학생 감상문 분석 결과물 및 도서 팩트시트 (보안/개인정보)
+# 학생 감상문 분석 결과물 (보안/개인정보)
 outputs/
-factsheets/
+
 
 # 분석 수행 시 적재되는 임시 모델 캐시 파일
 models_cache.json
 
 # 로그 파일
 *.log
+
+# [클라우드 마이그레이션] 구버전 로컬 상태 파일 — 현재는 Supabase DB에 저장됨
+data/
+book_cache.json
+session_progress.json
+session_progress.json.migrated
+screening_results.jsonl
+
+# Vercel
+.vercel/

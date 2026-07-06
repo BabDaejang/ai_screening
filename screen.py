@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
-"""AI 사용 의심 선별·검증 도구 — 메인 CLI 진입점.
+"""AI 사용 의심 선별·검증 도구 — 메인 CLI 진입점 (Supabase DB 계정 연동).
 
 사용법:
     python screen.py ./submissions/              # 기본 실행
     python screen.py ./submissions/ --verify-all # 전원 3단계
     python screen.py ./submissions/ --no-verify  # 3단계 생략
     python screen.py ./submissions/ --no-web     # 팩트시트 자동 생성 금지
-    python screen.py login                       # 로그인
-    python screen.py logout                      # 로그아웃
-    python screen.py add-profile                 # 프로필 등록
-    python screen.py list-profiles               # 프로필 목록
-    python screen.py delete-profile <이름>       # 프로필 삭제
-    python screen.py select-model                # 모델 변경
+    python screen.py register                    # 회원가입 (username + 비밀번호)
+    python screen.py login                       # 로그인 (세션 토큰 발급)
+    python screen.py logout                      # 로그아웃 (토큰 폐기)
+    python screen.py whoami                      # 현재 로그인 계정 확인
+    python screen.py delete-account              # 본인 계정 삭제
+    python screen.py select-model                # 모델 변경 (웹 대시보드 안내)
 """
 
+from dotenv import load_dotenv
+load_dotenv()  # SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / ENCRYPTION_KEY 로드
+
 import argparse
+import getpass
 import os
 import sys
 import yaml
+from pathlib import Path
 from typing import Optional
 
+from database import DatabaseError
 from utils.user_manager import UserManager
 from utils.cost_tracker import CostTracker
 from utils.docx_metadata import extract_docx_metadata
@@ -64,121 +70,145 @@ def _get_legacy_session(raw_session: Optional[dict]) -> Optional[dict]:
     }
 
 
-def cmd_login(um: UserManager):
-    """로그인 서브커맨드."""
-    profiles = um.list_profiles()
-    if not profiles:
-        print("등록된 프로필이 없습니다. 먼저 'add-profile'로 프로필을 등록하세요.")
-        return False
+# -------------------------------------------------------------
+# CLI 세션 토큰 저장소 (~/.ai_screening/cli_token)
+# 로그인 성공 시 발급된 무상태 Bearer 토큰을 로컬에 보관한다.
+# (구버전 profiles.yaml 평문 API 키 저장 방식은 완전히 폐기됨.)
+# -------------------------------------------------------------
+_TOKEN_FILE = Path.home() / ".ai_screening" / "cli_token"
 
-    print("\n=== 프로필 로그인 ===")
-    print("등록된 프로필:")
-    for i, p in enumerate(profiles, 1):
-        default_models = p.get("default_models", {})
-        prov = default_models.get("screening_provider") or (p["api_keys"][0] if p["api_keys"] else "없음")
-        print(f"  {i}. {p['name']} ({prov})")
 
+def _save_token(token: str) -> None:
+    _TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _TOKEN_FILE.write_text(token, encoding="utf-8")
+
+
+def _load_token() -> Optional[str]:
+    if not _TOKEN_FILE.exists():
+        return None
     try:
-        choice = int(input("\n프로필 번호 선택: ")) - 1
-        if choice < 0 or choice >= len(profiles):
-            print("잘못된 선택입니다.")
-            return False
-    except (ValueError, EOFError):
-        print("잘못된 입력입니다.")
+        return _TOKEN_FILE.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _clear_token() -> None:
+    try:
+        _TOKEN_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _current_user(um: UserManager) -> Optional[dict]:
+    """저장된 토큰으로 로그인 사용자 행을 복원한다 (만료/위조 시 None)."""
+    token = _load_token()
+    if not token:
+        return None
+    return um.get_user_by_token(token)
+
+
+def cmd_register(um: UserManager):
+    """회원가입 서브커맨드 (username + 비밀번호, bcrypt 해시 저장)."""
+    print("\n=== 회원가입 ===")
+    username = input("사용자 ID: ").strip()
+    password = getpass.getpass("비밀번호 (8자 이상): ")
+    password2 = getpass.getpass("비밀번호 확인: ")
+    if password != password2:
+        print("❌ 비밀번호가 일치하지 않습니다.")
+        return False
+    try:
+        um.register(username, password)
+    except ValueError as e:
+        print(f"❌ 가입 실패: {e}")
+        return False
+    print(f"✅ '{username}' 계정이 생성되었습니다. 'python screen.py login'으로 로그인하세요.")
+    print("   API 키 등록/모델 선택은 웹 대시보드에서 진행합니다.")
+    return True
+
+
+def cmd_login(um: UserManager):
+    """로그인 서브커맨드 (비밀번호 검증 → 세션 토큰 로컬 저장)."""
+    print("\n=== 로그인 ===")
+    username = input("사용자 ID: ").strip()
+    password = getpass.getpass("비밀번호: ")
+
+    result = um.login(username, password)
+    if not result:
+        print("\n❌ 사용자 ID 또는 비밀번호가 올바르지 않습니다.")
         return False
 
-    import getpass
-    password = getpass.getpass("암호 입력: ")
-
-    profile_name = profiles[choice]["name"]
-    result = um.login(profile_name, password)
-    if result:
-        legacy = _get_legacy_session(result)
-        print(f"\n✅ '{profile_name}' 프로필로 로그인했습니다.")
-        print(f"   프로바이더: {legacy['provider']}")
-        print(f"   스크리닝 모델: {legacy['model_screening']}")
-        print(f"   검증 모델: {legacy['model_verify']}")
-        return True
-    else:
-        print("\n❌ 암호가 올바르지 않습니다.")
-        return False
+    _save_token(result["token"])
+    dm = result.get("default_models", {})
+    print(f"\n✅ '{username}' 계정으로 로그인했습니다.")
+    print(f"   등록된 API 키: {', '.join(result.get('api_keys') or []) or '없음'}")
+    print(f"   스크리닝 모델: {dm.get('screening_provider')}/{dm.get('screening_model')}")
+    print(f"   검증 모델: {dm.get('verify_provider')}/{dm.get('verify_model')}")
+    return True
 
 
 def cmd_logout(um: UserManager):
-    """로그아웃 서브커맨드."""
-    current = um.get_current_profile()
-    if current:
-        um.logout()
-        print(f"✅ '{current}' 프로필에서 로그아웃했습니다.")
+    """로그아웃 서브커맨드 (로컬 토큰 폐기)."""
+    user = _current_user(um)
+    _clear_token()
+    if user:
+        print(f"✅ '{user['username']}' 계정에서 로그아웃했습니다.")
     else:
-        print("현재 로그인된 프로필이 없습니다.")
+        print("현재 로그인된 계정이 없습니다 (토큰 정리 완료).")
 
 
-def cmd_add_profile(um: UserManager, config: dict):
-    """프로필 등록 서브커맨드."""
-    um.interactive_add_profile(config)
-
-
-def cmd_list_profiles(um: UserManager):
-    """프로필 목록 서브커맨드."""
-    profiles = um.list_profiles()
-    current = um.get_current_profile()
-
-    if not profiles:
-        print("등록된 프로필이 없습니다.")
+def cmd_whoami(um: UserManager):
+    """현재 로그인 계정 확인 서브커맨드."""
+    user = _current_user(um)
+    if not user:
+        print("로그인되어 있지 않습니다. 'python screen.py login'을 실행하세요.")
         return
+    profile = um.get_public_profile(user)
+    dm = profile["default_models"]
+    print(f"\n=== 현재 계정 ===")
+    print(f"  사용자 ID : {profile['name']}")
+    print(f"  API 키    : {', '.join(profile['api_keys']) or '없음'}")
+    print(f"  스크리닝  : {dm.get('screening_provider')}/{dm.get('screening_model')}")
+    print(f"  검증      : {dm.get('verify_provider')}/{dm.get('verify_model')}\n")
 
-    print("\n=== 등록된 프로필 ===")
-    for p in profiles:
-        marker = " ← 현재" if p["name"] == current else ""
-        print(f"  • {p['name']} | {p['provider']} | 스크리닝: {p['model_screening']} | 검증: {p['model_verify']}{marker}")
-    print()
 
-
-def cmd_delete_profile(um: UserManager, name: str):
-    """프로필 삭제 서브커맨드."""
-    confirm = input(f"프로필 '{name}'을(를) 삭제하시겠습니까? (y/n): ")
+def cmd_delete_account(um: UserManager):
+    """본인 계정 삭제 서브커맨드 (프로젝트/체크포인트 cascade 삭제)."""
+    user = _current_user(um)
+    if not user:
+        print("먼저 로그인하세요.")
+        return
+    confirm = input(f"계정 '{user['username']}'와 모든 프로젝트 데이터를 삭제하시겠습니까? (y/n): ")
     if confirm.lower() == "y":
-        if um.delete_profile(name):
-            print(f"✅ 프로필 '{name}'이(가) 삭제되었습니다.")
+        if um.delete_user(user["id"]):
+            _clear_token()
+            print("✅ 계정이 삭제되었습니다.")
         else:
-            print(f"❌ 프로필 '{name}'을(를) 찾을 수 없습니다.")
+            print("❌ 계정 삭제에 실패했습니다.")
     else:
         print("삭제가 취소되었습니다.")
 
 
 def cmd_select_model(um: UserManager, config: dict):
     """모델 변경 서브커맨드."""
-    current = um.get_current_profile()
-    if not current:
-        print("먼저 로그인하세요.")
-        return
-    um.interactive_select_model(config)
+    print("모델 변경은 웹 대시보드(분석 설정 패널)를 사용해 주세요.")
 
 
-def ensure_login(um: UserManager, config: dict) -> dict:
-    """로그인 상태 확인, 필요 시 로그인/프로필 등록 유도.
+def ensure_login(um: UserManager, config: dict) -> Optional[dict]:
+    """로그인 상태 확인, 필요 시 로그인 유도.
 
     Returns:
         로그인된 프로필 정보 dict (provider, api_key, model_screening, model_verify)
-        또는 None (실패 시)
+        또는 None (실패 시). API 키는 이 시점에 DB에서 복호화된다.
     """
-    current = um.get_current_profile()
-    if current:
-        # 이미 로그인됨 — 세션 데이터 반환
-        return _get_legacy_session(um.get_session_data())
-
-    profiles = um.list_profiles()
-    if not profiles:
-        print("등록된 프로필이 없습니다. 프로필을 먼저 등록합니다.\n")
-        cmd_add_profile(um, config)
-        profiles = um.list_profiles()
-        if not profiles:
+    user = _current_user(um)
+    if not user:
+        print("로그인이 필요합니다.")
+        if not cmd_login(um):
             return None
-
-    if cmd_login(um):
-        return _get_legacy_session(um.get_session_data())
-    return None
+        user = _current_user(um)
+        if not user:
+            return None
+    return _get_legacy_session(um.get_session_data(user))
 
 
 def run_pipeline(args, config: dict, session: dict):
@@ -381,7 +411,7 @@ def run_pipeline(args, config: dict, session: dict):
 
 def main():
     # 1. sys.argv 전처리: 서브커맨드가 없으면 'run' 커맨드를 강제로 주입
-    commands = {'login', 'logout', 'add-profile', 'list-profiles', 'delete-profile', 'select-model', 'run'}
+    commands = {'register', 'login', 'logout', 'whoami', 'delete-account', 'select-model', 'run'}
     has_command = False
     for arg in sys.argv[1:]:
         if arg in commands:
@@ -410,15 +440,12 @@ def main():
     subparsers = parser.add_subparsers(dest="command", help="서브커맨드")
 
     # 서브커맨드 정의
-    subparsers.add_parser("login", help="프로필 로그인")
-    subparsers.add_parser("logout", help="프로필 로그아웃")
-    subparsers.add_parser("add-profile", help="새 프로필 등록")
-    subparsers.add_parser("list-profiles", help="등록된 프로필 목록")
-
-    del_parser = subparsers.add_parser("delete-profile", help="프로필 삭제")
-    del_parser.add_argument("profile_name", help="삭제할 프로필 이름")
-
-    subparsers.add_parser("select-model", help="현재 프로필의 모델 변경")
+    subparsers.add_parser("register", help="회원가입 (username + 비밀번호)")
+    subparsers.add_parser("login", help="계정 로그인 (세션 토큰 발급)")
+    subparsers.add_parser("logout", help="로그아웃 (토큰 폐기)")
+    subparsers.add_parser("whoami", help="현재 로그인 계정 확인")
+    subparsers.add_parser("delete-account", help="본인 계정 삭제")
+    subparsers.add_parser("select-model", help="모델 변경 (웹 대시보드 안내)")
 
     # run 서브커맨드 정의 (기본 실행 모드)
     run_parser = subparsers.add_parser("run", help="분석 실행")
@@ -434,24 +461,29 @@ def main():
     um = UserManager()
 
     # 서브커맨드 처리
-    if args.command == "login":
-        cmd_login(um)
-        return
-    elif args.command == "logout":
-        cmd_logout(um)
-        return
-    elif args.command == "add-profile":
-        cmd_add_profile(um, config)
-        return
-    elif args.command == "list-profiles":
-        cmd_list_profiles(um)
-        return
-    elif args.command == "delete-profile":
-        cmd_delete_profile(um, args.profile_name)
-        return
-    elif args.command == "select-model":
-        cmd_select_model(um, config)
-        return
+    try:
+        if args.command == "register":
+            cmd_register(um)
+            return
+        elif args.command == "login":
+            cmd_login(um)
+            return
+        elif args.command == "logout":
+            cmd_logout(um)
+            return
+        elif args.command == "whoami":
+            cmd_whoami(um)
+            return
+        elif args.command == "delete-account":
+            cmd_delete_account(um)
+            return
+        elif args.command == "select-model":
+            cmd_select_model(um, config)
+            return
+    except DatabaseError as e:
+        print(f"❌ 데이터베이스 연결 오류: {e}")
+        print("   .env의 SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY 설정을 확인하세요.")
+        sys.exit(1)
 
     # 메인 실행: 제출물 폴더 또는 파일 경로 필수
     if not args.submissions_dir:

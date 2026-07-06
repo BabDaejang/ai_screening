@@ -1,363 +1,193 @@
-"""사용자 프로필 관리 모듈.
+"""사용자 계정 관리 모듈 (Supabase DB 기반).
 
-API 키를 평문으로 프로필에 저장하고,
-로그인/로그아웃, 모델 선택 등의 기능을 제공합니다.
-프로필 파일: ~/.ai_screening/profiles.yaml
+구 버전(~/.ai_screening/profiles.yaml + .env 평문 API 키)을 전면 폐기하고:
+- 회원가입/로그인: username + 비밀번호(passlib bcrypt 단방향 해시, users.hashed_password)
+- API 키: Fernet(ENCRYPTION_KEY)으로 암호화하여 users.encrypted_api_keys(jsonb)에 저장
+- 세션: 무상태 Bearer 토큰 (utils.auth_utils) — 서버리스(Vercel) 호환
+
+이 클래스는 무상태(stateless)다. '현재 로그인 사용자'라는 전역 개념은 없으며,
+호출부(FastAPI 의존성/CLI)가 토큰으로 식별한 사용자 행(dict)을 넘겨 사용한다.
 """
 
-import os
+from __future__ import annotations
+
 import logging
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
-import yaml
+from database import DatabaseError, db_delete, db_insert, db_select_one, db_update
+from utils.auth_utils import (
+    create_access_token,
+    decode_access_token,
+    hash_password,
+    validate_credentials_format,
+    verify_password,
+)
+from utils.encryption_utils import EncryptionError, decrypt_api_key, encrypt_api_key
 
 logger = logging.getLogger(__name__)
 
-def write_env_keys(env_path: Path, keys_dict: dict) -> bool:
-    """.env 파일에서 특정 키들의 값을 안전하게 업데이트하거나 추가합니다."""
-    content = ""
-    if env_path.exists():
-        try:
-            with open(env_path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except OSError:
-            pass
-            
-    lines = content.splitlines()
-    updated_lines = []
-    handled_keys = set()
-    
-    # 기존 라인 분석 후 매칭되는 키 교체
-    for line in lines:
-        line_stripped = line.strip()
-        if not line_stripped or line_stripped.startswith("#"):
-            updated_lines.append(line)
-            continue
-        if "=" in line:
-            k, v = line.split("=", 1)
-            k = k.strip()
-            # 프로바이더명 -> .env 환경 변수명 맵핑
-            mapping = {"gemini": "GEMINI_API_KEY", "anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
-            matched_provider = None
-            for prov, env_name in mapping.items():
-                if k == env_name:
-                    matched_provider = prov
-                    break
-            
-            if matched_provider and matched_provider in keys_dict:
-                new_val = keys_dict[matched_provider]
-                updated_lines.append(f"{k}={new_val}")
-                handled_keys.add(matched_provider)
-            else:
-                updated_lines.append(line)
-        else:
-            updated_lines.append(line)
-            
-    # 신규 입력된 키 추가
-    mapping = {"gemini": "GEMINI_API_KEY", "anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
-    for prov, env_name in mapping.items():
-        if prov in keys_dict and prov not in handled_keys:
-            updated_lines.append(f"{env_name}={keys_dict[prov]}")
-            
-    try:
-        with open(env_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(updated_lines) + "\n")
-        return True
-    except OSError as e:
-        logger.error(f".env 파일 저장 실패: {e}")
-        return False
-
-# 프로필 저장 경로
-_PROFILES_DIR = Path.home() / ".ai_screening"
-_PROFILES_FILE = _PROFILES_DIR / "profiles.yaml"
+SUPPORTED_PROVIDERS = ("gemini", "anthropic", "openai")
 
 
 class UserManager:
-    """사용자 프로필 관리 클래스."""
+    """DB 기반 사용자 계정/API 키/기본 모델 관리."""
 
-    def __init__(self, profiles_path: Optional[str] = None):
-        """UserManager 초기화.
+    # ---------------------------------------------------------
+    # 회원가입 / 로그인
+    # ---------------------------------------------------------
+    def register(self, username: str, password: str) -> dict:
+        """회원가입. 성공 시 공개 사용자 정보 dict 반환, 실패 시 ValueError(사유)."""
+        username = (username or "").strip()
+        reason = validate_credentials_format(username, password)
+        if reason:
+            raise ValueError(reason)
 
-        Args:
-            profiles_path: 프로필 YAML 파일 경로. None이면 기본 경로 사용.
-        """
-        self._profiles_path = Path(profiles_path) if profiles_path else _PROFILES_FILE
-        self._data: dict = self._load()
-        # 메모리 키 캐시 - 시작 시 현재 프로필에서 자동 복원
-        self._current_decrypted_keys: dict[str, str] = self._restore_keys_from_file()
+        if db_select_one("users", {"username": username}, columns="id"):
+            raise ValueError(f"이미 존재하는 사용자 ID입니다: {username}")
 
-    def _restore_keys_from_file(self) -> dict:
-        """파일에 저장된 current_profile의 API 키를 복원합니다 (재기동 후 자동 복원)."""
-        current = self._data.get("current_profile")
-        if not current:
-            return {}
-        profile = self._data["profiles"].get(current, {})
-        return dict(profile.get("api_keys", {}))
+        row = db_insert("users", {
+            "username": username,
+            "hashed_password": hash_password(password),
+            "encrypted_api_keys": {},
+            "default_models": {},
+        })
+        logger.info("신규 사용자 가입: %s", username)
+        return {"user_id": row["id"], "username": row["username"]}
 
+    def authenticate(self, username: str, password: str) -> Optional[dict]:
+        """비밀번호 검증. 성공 시 사용자 행(dict), 실패 시 None."""
+        user = db_select_one("users", {"username": (username or "").strip()})
+        if not user:
+            return None
+        if not verify_password(password, user.get("hashed_password", "")):
+            return None
+        return user
 
-    def _load(self) -> dict:
-        """프로필 파일을 로드합니다."""
-        if not self._profiles_path.exists():
-            return {"current_profile": None, "profiles": {}}
-        try:
-            with open(self._profiles_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-            # 필수 키 보장
-            data.setdefault("current_profile", None)
-            data.setdefault("profiles", {})
-            return data
-        except yaml.YAMLError as e:
-            logger.error("프로필 파일 파싱 오류: %s", e)
-            return {"current_profile": None, "profiles": {}}
-        except OSError as e:
-            logger.error("프로필 파일 읽기 실패: %s", e)
-            return {"current_profile": None, "profiles": {}}
-
-    def _save(self) -> bool:
-        """프로필 데이터를 파일에 저장합니다."""
-        try:
-            self._profiles_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # [안전 장치] 저장 전, 현재 활성화된 프로필의 api_keys가 메모리 캐시보다 비어있는 경우 복원 보장
-            current = self._data.get("current_profile")
-            if current and current in self._data.get("profiles", {}):
-                profile = self._data["profiles"][current]
-                # 파일용 저장 데이터의 api_keys가 비어있고 메모리에 키가 존재한다면 덮어쓰기 방지
-                if not profile.get("api_keys") and self._current_decrypted_keys:
-                    profile["api_keys"] = dict(self._current_decrypted_keys)
-            
-            with open(self._profiles_path, "w", encoding="utf-8") as f:
-                yaml.dump(
-                    self._data, f,
-                    default_flow_style=False,
-                    allow_unicode=True,
-                    sort_keys=False,
-                )
-            return True
-        except OSError as e:
-            logger.error("프로필 저장 실패: %s", e)
-            return False
-
-    def add_profile(
-        self,
-        name: str,
-        password: Optional[str] = None,
-        provider: Optional[str] = None,
-        model_screening: Optional[str] = None,
-        model_verify: Optional[str] = None,
-        api_key: Optional[str] = None,
-    ) -> bool:
-        """새 프로필을 추가합니다 (비밀번호 없는 평문 관리 구조)."""
-        if name in self._data["profiles"]:
-            logger.error("이미 존재하는 프로필 이름: %s", name)
-            return False
-
-        self._data["profiles"][name] = {
-            "api_keys": {},
-            "default_models": {
-                "screening_provider": provider or "",
-                "screening_model": model_screening or "",
-                "verify_provider": provider or "",
-                "verify_model": model_verify or "",
-            },
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-        # 레거시 호환성 및 즉시 등록 지원
-        if api_key and provider:
-            self._data["profiles"][name]["api_keys"][provider] = api_key
-
-        # 첫 프로필이면 현재 프로필로 설정
-        if self._data["current_profile"] is None:
-            self._data["current_profile"] = name
-
-        return self._save()
-
-    @staticmethod
-    def _normalize_default_models(profile: dict) -> dict:
-        """[Migration & Fallback Guard] 구버전 프로필의 단일 모델 스키마를 2분할 스키마로 변환한다.
-
-        과거에는 {"provider", "model"} 또는 {"provider", "model_screening", "model_verify"}
-        형태로 저장된 경우가 있어, 분리된 키가 없으면 레거시 단일 값을 스크리닝/검증
-        양쪽의 Fallback으로 사용한다. 어떤 형태가 와도 4개 키를 모두 갖춘 dict를 반환
-        하므로 이후 로직이 KeyError 없이 안전하게 동작한다.
-        """
-        dm = profile.get("default_models") or {}
-        legacy_provider = dm.get("provider", "")
-        legacy_screening_model = dm.get("model_screening") or dm.get("model", "")
-        legacy_verify_model = dm.get("model_verify") or dm.get("model", "")
+    def login(self, username: str, password: str) -> Optional[dict]:
+        """로그인. 성공 시 세션 토큰 + 프로필 요약 반환, 실패 시 None."""
+        user = self.authenticate(username, password)
+        if not user:
+            logger.warning("로그인 실패: %s", username)
+            return None
+        token = create_access_token(user["id"], user["username"])
         return {
-            "screening_provider": dm.get("screening_provider") or legacy_provider,
-            "screening_model": dm.get("screening_model") or legacy_screening_model,
-            "verify_provider": dm.get("verify_provider") or legacy_provider,
-            "verify_model": dm.get("verify_model") or legacy_verify_model,
+            "token": token,
+            "name": user["username"],
+            "user_id": user["id"],
+            "api_keys": list((user.get("encrypted_api_keys") or {}).keys()),
+            "default_models": self._normalize_default_models(user),
         }
 
-    def add_api_key(self, profile_name: str, provider: str, api_key: str, password: Optional[str] = None) -> bool:
-        """현재 프로필에 특정 프로바이더의 API 키를 .env 파일에 저장하고 런타임에도 즉시 등록합니다."""
-        env_path = Path(__file__).parent.parent / ".env"
-        success = write_env_keys(env_path, {provider: api_key})
-        
-        env_mapping = {
-            "gemini": "GEMINI_API_KEY",
-            "anthropic": "ANTHROPIC_API_KEY",
-            "openai": "OPENAI_API_KEY"
-        }
-        env_name = env_mapping.get(provider)
-        if env_name and success:
-            os.environ[env_name] = api_key
-            self._current_decrypted_keys[provider] = api_key
-            
-        return success
-
-    def delete_api_key(self, profile_name: str, provider: str) -> bool:
-        """.env 파일 및 런타임 환경변수에서 특정 API 키를 빈 값으로 삭제합니다."""
-        env_path = Path(__file__).parent.parent / ".env"
-        success = write_env_keys(env_path, {provider: ""})
-        
-        env_mapping = {
-            "gemini": "GEMINI_API_KEY",
-            "anthropic": "ANTHROPIC_API_KEY",
-            "openai": "OPENAI_API_KEY"
-        }
-        env_name = env_mapping.get(provider)
-        if env_name and success:
-            if env_name in os.environ:
-                del os.environ[env_name]
-            if provider in self._current_decrypted_keys:
-                del self._current_decrypted_keys[provider]
-                
-        return success
-
-    def login(self, profile_name: str, password: Optional[str] = None) -> Optional[dict]:
-        """프로필에 로그인합니다 (비밀번호 검증 없이 즉시 로그인)."""
-        self._data = self._load()
-        profile = self._data["profiles"].get(profile_name)
-        if not profile:
-            logger.error("프로필을 찾을 수 없습니다: %s", profile_name)
+    def get_user_by_token(self, token: str) -> Optional[dict]:
+        """Bearer 토큰 → 사용자 행(dict). 위조/만료/삭제된 계정이면 None."""
+        payload = decode_access_token(token)
+        if not payload:
+            return None
+        try:
+            return db_select_one("users", {"id": payload["uid"]})
+        except DatabaseError as e:
+            logger.error("토큰 사용자 조회 실패: %s", e)
             return None
 
-        self._data["current_profile"] = profile_name
-        self._save()
+    def get_user_by_id(self, user_id: str) -> Optional[dict]:
+        return db_select_one("users", {"id": user_id})
 
-        # .env 또는 os.environ 에서 API 키 읽어오기
-        env_keys = {}
-        for prov, env_name in [("gemini", "GEMINI_API_KEY"), ("anthropic", "ANTHROPIC_API_KEY"), ("openai", "OPENAI_API_KEY")]:
-            val = os.getenv(env_name)
-            if val:
-                env_keys[prov] = val
-                
-        self._current_decrypted_keys = env_keys
+    def delete_user(self, user_id: str) -> bool:
+        """계정 삭제 (프로젝트/체크포인트는 FK cascade로 함께 삭제)."""
+        return bool(db_delete("users", {"id": user_id}))
 
-        default_models = self._normalize_default_models(profile)
+    # ---------------------------------------------------------
+    # API 키 (Fernet 암호화 저장)
+    # ---------------------------------------------------------
+    def set_api_key(self, user: dict, provider: str, api_key: str) -> bool:
+        """사용자 API 키를 암호화하여 DB에 저장한다 (.env 저장 방식 폐기)."""
+        if provider not in SUPPORTED_PROVIDERS:
+            logger.error("지원하지 않는 프로바이더: %s", provider)
+            return False
+        keys = dict(user.get("encrypted_api_keys") or {})
+        keys[provider] = encrypt_api_key(api_key.strip())
+        db_update("users", {"id": user["id"]}, {"encrypted_api_keys": keys})
+        user["encrypted_api_keys"] = keys  # 호출부가 들고 있는 행도 동기화
+        return True
 
-        return {
-            "name": profile_name,
-            "api_keys": list(env_keys.keys()),
-            "default_models": default_models
-        }
+    def delete_api_key(self, user: dict, provider: str) -> bool:
+        keys = dict(user.get("encrypted_api_keys") or {})
+        if provider not in keys:
+            return False
+        del keys[provider]
+        db_update("users", {"id": user["id"]}, {"encrypted_api_keys": keys})
+        user["encrypted_api_keys"] = keys
+        return True
 
-    def logout(self) -> None:
-        """현재 프로필 로그아웃 (메모리에서 API 키 제거)."""
-        # 1. 파일에 현재 프로필 해제 상태를 먼저 안전하게 저장
-        self._data["current_profile"] = None
-        self._save()
-        # 2. 저장 완료 후 메모리 캐시 초기화
-        self._current_decrypted_keys = {}
-        logger.info("로그아웃 완료.")
+    def get_decrypted_api_key(self, user: dict, provider: str) -> Optional[str]:
+        """LLM API 호출 직전에만 사용: 해당 프로바이더 키를 복호화하여 반환."""
+        token = (user.get("encrypted_api_keys") or {}).get(provider)
+        if not token:
+            return None
+        return decrypt_api_key(token)
 
-    def list_profiles(self) -> list[dict]:
-        """프로필 목록을 반환합니다 (비밀 정보 제외)."""
-        result = []
-        current = self._data.get("current_profile")
-        for name, profile in self._data["profiles"].items():
-            providers = list(profile.get("api_keys", {}).keys())
+    def get_decrypted_api_keys(self, user: dict) -> dict:
+        """등록된 모든 키를 복호화한 {provider: plain_key} dict.
 
-            default_models = self._normalize_default_models(profile)
-
-            result.append({
-                "name": name,
-                "api_keys": providers,
-                "default_models": default_models,
-                "is_current": (name == current),
-                "created_at": profile.get("created_at", ""),
-            })
+        일부 키가 복호화 불가(마스터 키 교체 등)여도 나머지 키는 정상 반환한다.
+        """
+        result: dict[str, str] = {}
+        for provider, token in (user.get("encrypted_api_keys") or {}).items():
+            try:
+                plain = decrypt_api_key(token)
+                if plain:
+                    result[provider] = plain
+            except EncryptionError as e:
+                logger.error("'%s' API 키 복호화 실패 (재등록 필요): %s", provider, e)
         return result
 
-    def delete_profile(self, name: str) -> bool:
-        """프로필을 삭제합니다."""
-        if name not in self._data["profiles"]:
-            logger.error("프로필을 찾을 수 없습니다: %s", name)
-            return False
+    # ---------------------------------------------------------
+    # 기본 모델 설정
+    # ---------------------------------------------------------
+    @staticmethod
+    def _normalize_default_models(user: dict) -> dict:
+        """어떤 형태로 저장돼 있어도 4개 키를 모두 갖춘 dict를 보장한다 (KeyError 방지)."""
+        dm = user.get("default_models") or {}
+        legacy_provider = dm.get("provider", "")
+        legacy_screening = dm.get("model_screening") or dm.get("model", "")
+        legacy_verify = dm.get("model_verify") or dm.get("model", "")
+        return {
+            "screening_provider": dm.get("screening_provider") or legacy_provider,
+            "screening_model": dm.get("screening_model") or legacy_screening,
+            "verify_provider": dm.get("verify_provider") or legacy_provider,
+            "verify_model": dm.get("verify_model") or legacy_verify,
+        }
 
-        del self._data["profiles"][name]
-
-        if self._data["current_profile"] == name:
-            self._data["current_profile"] = None
-            self._current_decrypted_keys = {}
-
-        return self._save()
-
-    def get_current_profile(self) -> Optional[str]:
-        """현재 활성 프로필 이름을 반환합니다."""
-        return self._data.get("current_profile")
-
-    def select_model(
-        self,
-        profile_name: str,
-        screening_provider: str,
-        screening_model: str,
-        verify_provider: str,
-        verify_model: str
-    ) -> bool:
-        """프로필의 디폴트 모델 선택을 업데이트합니다."""
-        profile = self._data["profiles"].get(profile_name)
-        if not profile:
-            logger.error("프로필을 찾을 수 없습니다: %s", profile_name)
-            return False
-
-        profile["default_models"] = {
+    def select_model(self, user: dict, screening_provider: str, screening_model: str,
+                     verify_provider: str, verify_model: str) -> bool:
+        default_models = {
             "screening_provider": screening_provider,
             "screening_model": screening_model,
             "verify_provider": verify_provider,
-            "verify_model": verify_model
+            "verify_model": verify_model,
         }
-        return self._save()
+        db_update("users", {"id": user["id"]}, {"default_models": default_models})
+        user["default_models"] = default_models
+        return True
 
-    def get_session_data(self) -> Optional[dict]:
-        """현재 로그인된 프로필의 세션 데이터를 반환합니다."""
-        current = self.get_current_profile()
-        if not current:
-            return None
-
-        profile = self._data["profiles"].get(current)
-        if not profile:
-            return None
-
-        default_models = self._normalize_default_models(profile)
-
-        # .env 또는 os.environ 에서 API 키 읽어오기
-        env_keys = {}
-        for prov, env_name in [("gemini", "GEMINI_API_KEY"), ("anthropic", "ANTHROPIC_API_KEY"), ("openai", "OPENAI_API_KEY")]:
-            val = os.getenv(env_name)
-            if val:
-                env_keys[prov] = val
-                
-        self._current_decrypted_keys = env_keys
-
+    # ---------------------------------------------------------
+    # 파이프라인용 세션 데이터
+    # ---------------------------------------------------------
+    def get_session_data(self, user: dict) -> dict:
+        """분석 파이프라인/CLI에 넘길 세션 데이터 (API 키는 복호화된 평문 dict)."""
         return {
-            "profile_name": current,
-            "api_keys": self._current_decrypted_keys,
-            "default_models": default_models
+            "profile_name": user["username"],
+            "user_id": user["id"],
+            "api_keys": self.get_decrypted_api_keys(user),
+            "default_models": self._normalize_default_models(user),
         }
 
-
-    def interactive_add_profile(self, config: dict) -> Optional[dict]:
-        print("대화형 추가는 웹 대시보드(http://localhost:8000)를 사용해 주세요.")
-        return None
-
-    def interactive_select_model(self, config: dict) -> bool:
-        print("모델 변경은 웹 대시보드를 사용해 주세요.")
-        return False
+    def get_public_profile(self, user: dict) -> dict:
+        """UI 표시용 공개 프로필 (키 원문/암호문 미포함)."""
+        return {
+            "name": user["username"],
+            "user_id": user["id"],
+            "api_keys": list((user.get("encrypted_api_keys") or {}).keys()),
+            "default_models": self._normalize_default_models(user),
+            "created_at": user.get("created_at", ""),
+        }
